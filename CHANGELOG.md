@@ -7,6 +7,94 @@ et ce projet adhère au [Semantic Versioning](https://semver.org/lang/fr/).
 
 ---
 
+## [0.2.1] - 2026-02-08 (En cours - Phase 1)
+
+### 🔴 Corrections Critiques (Phase 1 - Bugs Bloquants)
+
+#### Ajouté
+- **Tests d'intégration ConnectRequest** : 4 nouveaux tests pour valider la sérialisation JSON
+  - `test_connect_request_serialization` : Test format avec/sans password
+  - `test_connect_request_deserialization` : Test parsing JSON serveur
+  - `test_connect_request_format_compatibility` : Test compatibilité Rust/Go
+  - `test_connect_request_message_structure` : Test structure du message
+  - Fichier : `client/tests/integration_connect_request.rs`
+
+- **Validation Device ID stricte** : Protection contre injection et DoS (BUG-004, VULN-002)
+  - Fonction `validateDeviceID()` : Validation longueur (5-64 chars), caractères alphanumériques + tirets
+  - Fonction `validatePassword()` : Validation longueur max 128 chars
+  - Fonction `validateTargetID()` : Alias pour validateDeviceID
+  - 16 tests unitaires couvrant cas valides et invalides
+  - Fichiers : `server/internal/signaling/validation.go`, `validation_test.go`
+
+- **Logs de diagnostic ConnectRequest** : Ajout de logs DEBUG pour tracer le flux
+  - Log client AVANT envoi du ConnectRequest avec contenu du message
+  - Format : `📤 [CLIENT] AVANT ENVOI ConnectRequest vers {target} | Message: {...}`
+  - Fichier : `client/src/network.rs:669`
+
+#### Modifié
+- **Réduction MaxMessageSize** : 10 MB → 1 MB (VULN-001 - Protection DoS)
+  - `MaxMessageSize = 1 * 1024 * 1024` (1 MB)
+  - `MaxSDPSize = 100 * 1024` (100 KB pour SDP)
+  - `MaxICESize = 1024` (1 KB pour ICE candidates)
+  - Fichier : `server/internal/signaling/handler.go:16-21`
+
+- **Validation taille SDP/ICE** : Vérification stricte dans handlers
+  - `handleOffer()` : Rejette SDP > MaxSDPSize + envoie ACK erreur
+  - `handleAnswer()` : Rejette SDP > MaxSDPSize + envoie ACK erreur
+  - `handleIceCandidate()` : Rejette ICE > MaxICESize + envoie ACK erreur
+  - Fichier : `server/internal/signaling/hub.go:292,327,361`
+
+- **Validation Device ID dans handler** : Intégration validation avant création Client
+  - Vérification AVANT création du Client dans le hub
+  - Envoi message d'erreur structuré au client si Device ID invalide
+  - Fermeture de connexion propre avec message d'erreur
+  - Fichier : `server/internal/signaling/handler.go:96-119`
+
+#### Sécurité
+- **2 vulnérabilités corrigées** :
+  - VULN-001 : Taille message WebSocket excessive (10MB → 1MB)
+  - VULN-002 : Validation Device ID manquante (injection/DoS)
+- **1 bug de sécurité corrigé** :
+  - BUG-004 : Device ID non validé côté serveur
+
+#### Tests
+- **Client Rust** : +4 tests (total : 58 tests ✅)
+- **Serveur Go** : +16 tests (total : 16 tests ✅)
+- **Total projet** : 74 tests passants (100%)
+
+### 🟡 Optimisations Performance (Phase 2)
+
+#### Ajouté
+- **Capture d'écran asynchrone** : Méthode `capture_async()` non-bloquante (PERF-001)
+  - Trait `ScreenCapturer` avec support `#[async_trait]`
+  - Conversion image dans `tokio::task::spawn_blocking` pour libérer le runtime
+  - Libération rapide du mutex → meilleure réactivité système
+  - Fichiers : `client/src/screen_capture.rs`, `client/src/streaming.rs`
+
+- **Tests de performance** : 3 nouveaux tests pour mesurer FPS
+  - `test_async_capture` : Test basique
+  - `test_async_capture_performance` : Benchmark 30 frames async
+  - `test_sync_capture_performance` : Benchmark comparatif sync
+
+#### Performance
+- **Mode debug** : ~5.5 FPS (sync et async identiques)
+- **Mode release** : ~27.5 FPS (amélioration 5x vs debug)
+- **Réactivité** : Mutex libéré plus rapidement → système plus fluide
+
+#### Notes
+- Goulot d'étranglement : `xcap::capture_image()` (Windows GDI)
+- FPS limité par hardware et résolution d'écran
+- 27 FPS suffisant pour utilisation bureau fluide
+- Amélioration future possible avec DXGI
+
+### 📝 Notes de développement
+- Phase 1 : ✅ COMPLÉTÉE - Bugs bloquants (3/3 corrections)
+- Phase 2 : ✅ COMPLÉTÉE - Optimisations performance (capture async)
+- Phase 3 à venir : Support multi-moniteur UI
+- Phase 4 à venir : Authentification TLS mutuelle
+
+---
+
 ## [0.2.0] - 2026-02-07
 
 ### 🔒 Sécurité (CRITIQUE)

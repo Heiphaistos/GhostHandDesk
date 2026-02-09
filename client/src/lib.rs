@@ -1,7 +1,6 @@
 //! GhostHandDesk Client Library
 //!
 //! Bibliothèque de bureau à distance avec WebRTC
-#![allow(dead_code)] // Bibliothèque : les exports publics ne sont pas tous consommés par le binaire
 
 pub mod adaptive_bitrate;
 pub mod audit;
@@ -14,7 +13,6 @@ pub mod protocol;
 pub mod screen_capture;
 pub mod storage;
 pub mod streaming;
-pub mod ui;
 pub mod validation;
 pub mod video_encoder;
 

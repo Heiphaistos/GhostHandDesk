@@ -52,6 +52,13 @@ GhostHandDesk-Portable/Instance2/
 GhostHandDesk-Portable/_start_server.bat
 GhostHandDesk-Portable/*.exe
 
+# Build output
+build-output.log
+server/signaling-server.exe
+
+# Windows artifacts
+nul
+
 # Temp
 *.tmp
 *.temp
