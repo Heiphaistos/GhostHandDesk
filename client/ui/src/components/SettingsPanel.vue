@@ -191,7 +191,8 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue';
+import { ref, computed, onMounted } from 'vue';
+import { invoke } from '@tauri-apps/api/core';
 
 // Emits
 const emit = defineEmits<{
@@ -239,6 +240,26 @@ const stunServersText = computed({
       .map((s) => s.trim())
       .filter((s) => s.length > 0);
   },
+});
+
+// Charger la config depuis le backend au montage
+onMounted(async () => {
+  try {
+    const config = await invoke<any>('get_config');
+    if (config) {
+      settings.value.serverUrl = config.server_url || settings.value.serverUrl;
+      settings.value.stunServers = config.stun_servers || settings.value.stunServers;
+      settings.value.codec = config.video_config?.codec || settings.value.codec;
+      settings.value.framerate = config.video_config?.framerate || settings.value.framerate;
+      settings.value.bitrate = config.video_config?.bitrate || settings.value.bitrate;
+      settings.value.hardwareAcceleration = config.video_config?.hardware_acceleration ?? settings.value.hardwareAcceleration;
+      settings.value.requirePassword = config.security_config?.require_auth ?? settings.value.requirePassword;
+      settings.value.encryptData = config.security_config?.e2e_encryption ?? settings.value.encryptData;
+      console.log('[SETTINGS] Config chargée depuis le backend');
+    }
+  } catch (error) {
+    console.warn('[SETTINGS] Impossible de charger la config backend:', error);
+  }
 });
 
 // Méthodes

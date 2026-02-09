@@ -228,8 +228,38 @@ function copyDeviceId() {
   }
 }
 
-function handleSettingsUpdate(_settings: any) {
-  // TODO: Envoyer au backend
+async function handleSettingsUpdate(settings: any) {
+  try {
+    // Mapper les settings UI vers le format Config Rust
+    const newConfig = {
+      server_url: settings.serverUrl,
+      stun_servers: settings.stunServers,
+      turn_servers: [],
+      video_config: {
+        framerate: settings.framerate,
+        codec: settings.codec,
+        bitrate: settings.bitrate,
+        hardware_acceleration: settings.hardwareAcceleration,
+        resolution: null,
+      },
+      network_config: {
+        max_packet_size: 65536,
+        connection_timeout: 30,
+        enable_ipv6: true,
+      },
+      security_config: {
+        e2e_encryption: settings.encryptData,
+        require_auth: settings.requirePassword,
+        cert_path: null,
+        password_hash: null,
+      },
+    };
+
+    await invoke('update_config', { newConfig });
+    console.log('[APP] Configuration mise à jour avec succès');
+  } catch (error) {
+    console.error('Erreur mise à jour settings:', error);
+  }
 }
 </script>
 

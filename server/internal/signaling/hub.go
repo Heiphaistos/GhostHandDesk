@@ -243,8 +243,13 @@ func (c *Client) checkRateLimit() bool {
 
 	c.messageCount++
 	if c.messageCount > c.maxMessagesPerMin {
-		log.Printf("[RATE_LIMIT] Client %s dépasse la limite (%d messages/min)", c.ID, c.maxMessagesPerMin)
+		log.Printf("[RATE_LIMIT] ❌ Client %s dépasse la limite (%d messages/min)", c.ID, c.maxMessagesPerMin)
 		return false
+	}
+
+	// Log DEBUG: afficher compteur actuel (seulement en mode verbose)
+	if c.messageCount%10 == 1 || c.messageCount <= 3 {
+		log.Printf("[RATE_LIMIT] ✅ Client %s: %d/%d messages", c.ID, c.messageCount, c.maxMessagesPerMin)
 	}
 
 	return true
@@ -254,11 +259,16 @@ func (c *Client) checkRateLimit() bool {
 func (c *Client) handleMessage(msg *models.Message) {
 	// Vérifier le rate limit
 	if !c.checkRateLimit() {
-		log.Printf("[CLIENT %s] Message rejeté (rate limit dépassé)", c.ID)
+		log.Printf("[CLIENT %s] ❌ Message rejeté (rate limit dépassé)", c.ID)
 		return
 	}
 
-	log.Printf("[CLIENT %s] Message reçu: %s", c.ID, msg.Type)
+	log.Printf("[CLIENT %s] ✅ Message reçu: Type='%s' | Data présent=%v", c.ID, msg.Type, msg.Data != nil)
+
+	// Log spécial pour ConnectRequest
+	if msg.Type == models.TypeConnectRequest {
+		log.Printf("[DIAGNOSTIC] 🔍 ConnectRequest détecté pour client %s, passage au handler...", c.ID)
+	}
 
 	switch msg.Type {
 	case models.TypeOffer:
@@ -288,9 +298,10 @@ func (c *Client) handleOffer(msg *models.Message) {
 		return
 	}
 
-	// Validation : vérifier la taille des données (max 100KB pour offer)
-	if len(data) > 100*1024 {
-		log.Printf("[CLIENT] Offer trop grande: %d bytes", len(data))
+	// Validation : vérifier la taille des données (max MaxSDPSize pour offer)
+	if len(data) > MaxSDPSize {
+		log.Printf("[CLIENT %s] Offer SDP trop grande: %d bytes (max: %d)", c.ID, len(data), MaxSDPSize)
+		c.sendAck("Offer", "error", "SDP trop grande")
 		return
 	}
 
@@ -322,9 +333,10 @@ func (c *Client) handleAnswer(msg *models.Message) {
 		return
 	}
 
-	// Validation : vérifier la taille
-	if len(data) > 100*1024 {
-		log.Printf("[CLIENT] Answer trop grande: %d bytes", len(data))
+	// Validation : vérifier la taille (max MaxSDPSize pour answer)
+	if len(data) > MaxSDPSize {
+		log.Printf("[CLIENT %s] Answer SDP trop grande: %d bytes (max: %d)", c.ID, len(data), MaxSDPSize)
+		c.sendAck("Answer", "error", "SDP trop grande")
 		return
 	}
 
@@ -356,6 +368,14 @@ func (c *Client) handleIceCandidate(msg *models.Message) {
 		c.sendAck("IceCandidate", "error", "Erreur de marshaling")
 		return
 	}
+
+	// Validation : vérifier la taille (max MaxICESize pour ICE candidate)
+	if len(data) > MaxICESize {
+		log.Printf("[CLIENT %s] ICE candidate trop grande: %d bytes (max: %d)", c.ID, len(data), MaxICESize)
+		c.sendAck("IceCandidate", "error", "ICE candidate trop grande")
+		return
+	}
+
 	var ice models.IceCandidateMessage
 	if err := json.Unmarshal(data, &ice); err != nil {
 		log.Printf("[CLIENT] Erreur parsing ICE: %v", err)
@@ -383,18 +403,25 @@ func (c *Client) handleIceCandidate(msg *models.Message) {
 
 // handleConnectRequest traite une demande de connexion
 func (c *Client) handleConnectRequest(msg *models.Message) {
+	log.Printf("[DIAGNOSTIC] 🚀 handleConnectRequest APPELÉ pour client %s", c.ID)
+
 	data, err := json.Marshal(msg.Data)
 	if err != nil {
-		log.Printf("[CLIENT] Erreur marshal data: %v", err)
+		log.Printf("[CLIENT] ❌ Erreur marshal data: %v", err)
 		c.sendAck("ConnectRequest", "error", "Erreur de marshaling")
 		return
 	}
+
+	log.Printf("[DIAGNOSTIC] 📦 Data marshaled, taille: %d bytes | Contenu: %s", len(data), string(data))
+
 	var req models.ConnectRequestMessage
 	if err := json.Unmarshal(data, &req); err != nil {
-		log.Printf("[CLIENT] Erreur parsing connect request: %v", err)
+		log.Printf("[CLIENT] ❌ Erreur parsing connect request: %v | Data: %s", err, string(data))
 		c.sendAck("ConnectRequest", "error", "Erreur de parsing")
 		return
 	}
+
+	log.Printf("[DIAGNOSTIC] ✅ ConnectRequest parsé: TargetID='%s', Password présent=%v", req.TargetID, req.Password != nil)
 
 	// Masquer le password dans les logs pour la sécurité
 	passwordMasked := "***"

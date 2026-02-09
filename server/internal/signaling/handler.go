@@ -2,6 +2,7 @@ package signaling
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"time"
@@ -12,8 +13,11 @@ import (
 )
 
 // Constantes de configuration
+// VULN-001 : Limite réduite de 10MB à 1MB pour prévenir attaques DoS
 const (
-	MaxMessageSize  = 10 * 1024 * 1024 // 10 MB
+	MaxMessageSize  = 1 * 1024 * 1024  // 1 MB (suffisant pour SDP/ICE/signaling)
+	MaxSDPSize      = 100 * 1024       // 100 KB max pour un SDP
+	MaxICESize      = 1024             // 1 KB max pour un ICE candidate
 	ReadBufferSize  = 4096
 	WriteBufferSize = 4096
 )
@@ -94,8 +98,23 @@ func HandleWebSocket(hub *Hub, cfg *config.Config, w http.ResponseWriter, r *htt
 	}
 
 	deviceID := regData.DeviceID
-	if deviceID == "" {
-		log.Printf("[HANDLER] Device ID vide")
+
+	// Valider le Device ID (BUG-004 : Validation manquante)
+	if err := validateDeviceID(deviceID); err != nil {
+		log.Printf("[HANDLER] Device ID invalide: %v", err)
+
+		// Envoyer message d'erreur au client avant de fermer
+		errorMsg := map[string]interface{}{
+			"type": "Error",
+			"data": map[string]interface{}{
+				"code":    400,
+				"message": fmt.Sprintf("Device ID invalide: %v", err),
+			},
+		}
+		if errData, marshalErr := json.Marshal(errorMsg); marshalErr == nil {
+			conn.WriteMessage(websocket.TextMessage, errData)
+		}
+
 		conn.Close()
 		return
 	}

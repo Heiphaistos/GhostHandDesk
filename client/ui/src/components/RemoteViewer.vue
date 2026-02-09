@@ -427,8 +427,27 @@ function captureScreenshot() {
   });
 }
 
-function updateQuality() {
-  // TODO: Envoyer au backend pour ajuster le framerate/bitrate
+async function updateQuality() {
+  // Presets qualité : low / medium / high
+  const presets: Record<string, { framerate: number; bitrate: number; codec: string }> = {
+    low: { framerate: 15, bitrate: 1500, codec: 'JPEG' },
+    medium: { framerate: 30, bitrate: 4000, codec: 'JPEG' },
+    high: { framerate: 60, bitrate: 8000, codec: 'H264' },
+  };
+
+  const preset = presets[quality.value] || presets.medium;
+
+  try {
+    const currentConfig = await invoke<any>('get_config');
+    currentConfig.video_config.framerate = preset.framerate;
+    currentConfig.video_config.bitrate = preset.bitrate;
+    currentConfig.video_config.codec = preset.codec;
+
+    await invoke('update_config', { newConfig: currentConfig });
+    console.log(`[VIEWER] Qualité mise à jour: ${quality.value}`, preset);
+  } catch (error) {
+    console.error('Erreur mise à jour qualité:', error);
+  }
 }
 </script>
 
