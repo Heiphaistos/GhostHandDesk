@@ -15,6 +15,75 @@ use ghost_hand_client::streaming::{Streamer, Receiver, InputHandler};
 use ghost_hand_client::screen_capture;
 use ghost_hand_client::video_encoder;
 
+// Serveur de signalement embarqué dans le binaire
+const EMBEDDED_SERVER: &[u8] = include_bytes!("../../../server/signaling-server.exe");
+
+/// Extraire et lancer le serveur de signalement embarqué
+fn start_embedded_server() -> Option<(std::process::Child, std::path::PathBuf)> {
+    use std::io::Write;
+
+    // Dossier temp à côté de l'exécutable
+    let server_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.join(".ghd-server")))
+        .unwrap_or_else(|| std::env::temp_dir().join("ghd-server"));
+
+    if let Err(e) = std::fs::create_dir_all(&server_dir) {
+        eprintln!("[SERVER] Impossible de créer le dossier serveur: {}", e);
+        return None;
+    }
+
+    let server_path = server_dir.join("signaling-server.exe");
+
+    // Écrire le serveur seulement si absent ou taille différente (mise à jour)
+    let need_extract = if server_path.exists() {
+        match std::fs::metadata(&server_path) {
+            Ok(meta) => meta.len() != EMBEDDED_SERVER.len() as u64,
+            Err(_) => true,
+        }
+    } else {
+        true
+    };
+
+    if need_extract {
+        println!("[SERVER] Extraction du serveur embarqué ({} bytes)...", EMBEDDED_SERVER.len());
+        match std::fs::File::create(&server_path) {
+            Ok(mut file) => {
+                if let Err(e) = file.write_all(EMBEDDED_SERVER) {
+                    eprintln!("[SERVER] Erreur d'écriture du serveur: {}", e);
+                    return None;
+                }
+            }
+            Err(e) => {
+                eprintln!("[SERVER] Impossible de créer le fichier serveur: {}", e);
+                return None;
+            }
+        }
+    }
+
+    // Lancer le serveur avec les variables d'environnement nécessaires
+    println!("[SERVER] Lancement du serveur de signalement...");
+    match std::process::Command::new(&server_path)
+        .env("REQUIRE_TLS", "false")
+        .env("DISABLE_ORIGIN_CHECK", "true")
+        .env("PORT", "9000")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => {
+            println!("[SERVER] Serveur démarré (PID: {})", child.id());
+            // Attendre un peu pour que le serveur soit prêt
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            Some((child, server_dir))
+        }
+        Err(e) => {
+            eprintln!("[SERVER] Erreur de lancement du serveur: {}", e);
+            None
+        }
+    }
+}
+
 #[derive(Clone, Serialize)]
 struct ConnectionRequest {
     from: String,
@@ -593,6 +662,10 @@ async fn start_listening_for_requests(
 }
 
 fn main() {
+    // Lancer le serveur de signalement embarqué
+    let server_process: Arc<std::sync::Mutex<Option<(std::process::Child, std::path::PathBuf)>>> =
+        Arc::new(std::sync::Mutex::new(start_embedded_server()));
+
     // Initialiser la configuration
     let config = Config::default();
 
@@ -658,8 +731,9 @@ fn main() {
         streamer_handle: Arc::new(Mutex::new(None)),
     };
 
-    // Cloner le device_id pour la closure setup
+    // Cloner pour les closures
     let device_id_for_title = device_id.clone();
+    let server_for_setup = Arc::clone(&server_process);
 
     // Lancer l'application Tauri
     tauri::Builder::default()
@@ -690,10 +764,6 @@ fn main() {
             get_storage_stats,
         ])
         .setup(move |app| {
-            // NE PAS démarrer le serveur automatiquement
-            // Il doit être lancé MANUELLEMENT en externe pour permettre plusieurs instances
-            // Le serveur doit être lancé avec 1-SERVEUR.bat qui configure le port 9000
-
             // Récupérer la fenêtre principale
             let window = match app.get_webview_window("main") {
                 Some(w) => w,
@@ -708,6 +778,13 @@ fn main() {
                 eprintln!("[TAURI] Impossible de définir le titre: {}", e);
             }
 
+            // Afficher le PID du serveur
+            if let Ok(guard) = server_for_setup.lock() {
+                if let Some((ref child, _)) = *guard {
+                    println!("[TAURI] Serveur embarqué actif (PID: {})", child.id());
+                }
+            }
+
             println!("[TAURI] Application initialisée");
             println!("[TAURI] Interface disponible");
 
@@ -715,10 +792,21 @@ fn main() {
         })
         .on_window_event(|_window, event| {
             if let tauri::WindowEvent::Destroyed = event {
-                println!("[APP] Fenêtre fermée");
-                // Le serveur est géré séparément - pas de nettoyage de processus
+                println!("[APP] Fenêtre fermée, nettoyage en cours...");
             }
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+
+    // Nettoyage : tuer le serveur embarqué à la fermeture de l'app
+    // take() pour extraire la valeur et dropper le guard avant la fin du scope
+    let server_data = server_process.lock().ok().and_then(|mut guard| guard.take());
+    if let Some((mut child, server_dir)) = server_data {
+        println!("[SERVER] Arrêt du serveur (PID: {})...", child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        // Nettoyer le dossier d'extraction
+        let _ = std::fs::remove_dir_all(&server_dir);
+        println!("[SERVER] Serveur arrêté et nettoyé");
+    }
 }
