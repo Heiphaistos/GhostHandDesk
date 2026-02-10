@@ -47,7 +47,7 @@ pub struct ImageEncoder {
 impl ImageEncoder {
     pub fn new(width: u32, height: u32, framerate: u32) -> Result<Self> {
         Ok(Self {
-            quality: 85, // Qualité par défaut (haute)
+            quality: 55, // Qualité optimisée pour faible latence
             info: EncoderInfo {
                 codec: VideoCodec::JPEG,
                 width,

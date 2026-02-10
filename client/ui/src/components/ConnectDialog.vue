@@ -6,6 +6,27 @@
         <p class="subtitle">Entrez le Device ID de l'appareil que vous souhaitez contrôler</p>
       </div>
 
+      <!-- Appareils détectés sur le réseau local -->
+      <div v-if="discoveredPeers.length > 0" class="discovered-section">
+        <h3>Appareils détectés sur le réseau</h3>
+        <div class="discovered-list">
+          <button
+            v-for="peer in discoveredPeers"
+            :key="peer.device_id"
+            class="discovered-peer"
+            @click="connectToPeer(peer)"
+            :disabled="connecting"
+          >
+            <span class="peer-icon">🖥️</span>
+            <div class="peer-info">
+              <span class="peer-id">{{ peer.device_id }}</span>
+              <span class="peer-ip">{{ peer.ip }}:{{ peer.port }}</span>
+            </div>
+            <span class="peer-arrow">→</span>
+          </button>
+        </div>
+      </div>
+
       <form @submit.prevent="handleSubmit" class="connect-form">
         <!-- Server URL (collapsible) -->
         <div class="form-group server-group">
@@ -130,7 +151,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { ref, onMounted, onUnmounted } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 
 // Props
@@ -162,8 +183,31 @@ const serverConnected = ref(true);
 const changingServer = ref(false);
 const serverError = ref('');
 
+// Auto-discovery LAN
+interface DiscoveredPeer {
+  device_id: string;
+  ip: string;
+  port: number;
+  last_seen: number;
+}
+const discoveredPeers = ref<DiscoveredPeer[]>([]);
+let discoveryInterval: ReturnType<typeof setInterval> | null = null;
+
 // Charger l'URL du serveur actuel au montage
 onMounted(async () => {
+  // Polling des peers découverts toutes les 2 secondes
+  discoveryInterval = setInterval(async () => {
+    try {
+      discoveredPeers.value = await invoke<DiscoveredPeer[]>('get_discovered_peers');
+    } catch (e) {
+      // Silencieux
+    }
+  }, 2000);
+  // Premier fetch immédiat
+  try {
+    discoveredPeers.value = await invoke<DiscoveredPeer[]>('get_discovered_peers');
+  } catch (e) {}
+
   try {
     const info = await invoke<any>('get_network_info');
     currentServerUrl.value = info.server_url || 'ws://localhost:9000/ws';
@@ -202,6 +246,36 @@ async function handleChangeServer() {
   } finally {
     changingServer.value = false;
   }
+}
+
+onUnmounted(() => {
+  if (discoveryInterval) {
+    clearInterval(discoveryInterval);
+  }
+});
+
+async function connectToPeer(peer: DiscoveredPeer) {
+  // Auto-configurer le serveur URL vers le peer découvert
+  const peerServerUrl = `ws://${peer.ip}:${peer.port}/ws`;
+  if (peerServerUrl !== currentServerUrl.value) {
+    changingServer.value = true;
+    serverError.value = '';
+    try {
+      await invoke('update_server_url', { serverUrl: peerServerUrl });
+      currentServerUrl.value = peerServerUrl;
+      serverUrl.value = peerServerUrl;
+      serverConnected.value = true;
+      emit('serverChanged', peerServerUrl);
+    } catch (e: any) {
+      serverError.value = e.message || e || 'Impossible de se connecter';
+      serverConnected.value = false;
+      changingServer.value = false;
+      return;
+    }
+    changingServer.value = false;
+  }
+  // Lancer la connexion vers le device
+  emit('connect', peer.device_id, null);
 }
 
 function showHelp() {
@@ -370,6 +444,78 @@ function showAbout() {
   border-radius: 6px;
   font-size: 13px;
   color: #9d9d9d;
+}
+
+/* Discovered peers */
+.discovered-section {
+  margin-bottom: 20px;
+}
+
+.discovered-section h3 {
+  font-size: 13px;
+  color: #4ec9b0;
+  margin-bottom: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.discovered-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.discovered-peer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  background: #2d2d30;
+  border: 1px solid #3e3e42;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+  color: #ccc;
+  text-align: left;
+  width: 100%;
+}
+
+.discovered-peer:hover:not(:disabled) {
+  background: #3e3e42;
+  border-color: #4ec9b0;
+  transform: translateY(-1px);
+}
+
+.discovered-peer:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.peer-icon {
+  font-size: 24px;
+}
+
+.peer-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.peer-id {
+  font-family: 'Courier New', monospace;
+  font-size: 13px;
+  color: #4ec9b0;
+}
+
+.peer-ip {
+  font-size: 11px;
+  color: #888;
+}
+
+.peer-arrow {
+  font-size: 18px;
+  color: #4ec9b0;
 }
 
 /* Server URL section */

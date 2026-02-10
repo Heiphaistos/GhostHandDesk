@@ -56,13 +56,17 @@
         @disconnect="handleDisconnect"
       />
 
-      <!-- Écran "contrôlé" (celui qui a accepté la connexion) -->
-      <div v-else class="controlled-overlay">
-        <div class="controlled-content">
-          <div class="controlled-icon">🖥️</div>
-          <h2>Session de contrôle active</h2>
-          <p><code>{{ connectedTo }}</code> contrôle cet appareil</p>
-          <button @click="handleDisconnect" class="disconnect-btn-large">
+      <!-- Écran "contrôlé" avec preview (celui qui a accepté la connexion) -->
+      <div v-else class="controlled-view">
+        <canvas ref="previewCanvasRef" class="preview-canvas"></canvas>
+        <div v-if="!previewActive" class="preview-waiting">
+          <p>Démarrage du preview...</p>
+        </div>
+        <div class="controlled-controls">
+          <div class="controlled-badge">
+            🖥️ <code>{{ connectedTo }}</code> contrôle cet appareil
+          </div>
+          <button @click="handleDisconnect" class="disconnect-btn-floating">
             Arrêter le partage
           </button>
         </div>
@@ -88,7 +92,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue';
+import { ref, onMounted, onUnmounted, computed, watch } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import ConnectDialog from './components/ConnectDialog.vue';
 import RemoteViewer from './components/RemoteViewer.vue';
@@ -116,6 +120,11 @@ const networkInfo = ref<{local_ip: string; port: string; server_url: string}>({
   server_url: '',
 });
 
+// Preview local (PC contrôlé)
+const previewCanvasRef = ref<HTMLCanvasElement | null>(null);
+const previewActive = ref(false);
+let previewHandler: ((event: Event) => void) | null = null;
+
 // États pour la popup de demande de connexion
 const connectionRequestVisible = ref(false);
 const pendingRequest = ref<ConnectionRequest>({
@@ -134,6 +143,60 @@ const statusText = computed(() => {
   if (connected.value) return `Connecté à ${connectedTo.value}`;
   if (connecting.value) return 'Connexion...';
   return 'Déconnecté';
+});
+
+// Preview local : écouter les frames quand contrôlé
+watch(isControlled, (val) => {
+  if (val) {
+    // Setup le listener pour les frames du preview local
+    previewHandler = ((event: Event) => {
+      const canvas = previewCanvasRef.value;
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      const detail = (event as CustomEvent).detail;
+      const binaryString = atob(detail.data);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+
+      const blob = new Blob([bytes], { type: 'image/jpeg' });
+      createImageBitmap(blob).then((bmp) => {
+        // Adapter le canvas au container
+        const parent = canvas.parentElement;
+        if (parent) {
+          canvas.width = parent.clientWidth;
+          canvas.height = parent.clientHeight;
+        }
+        // Dessiner avec ratio préservé
+        const scale = Math.min(canvas.width / bmp.width, canvas.height / bmp.height);
+        const dw = bmp.width * scale;
+        const dh = bmp.height * scale;
+        const dx = (canvas.width - dw) / 2;
+        const dy = (canvas.height - dh) / 2;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(bmp, dx, dy, dw, dh);
+        bmp.close();
+        if (!previewActive.value) previewActive.value = true;
+      }).catch(() => {});
+    });
+    window.addEventListener('ghosthand-local-preview', previewHandler);
+  } else {
+    // Cleanup
+    if (previewHandler) {
+      window.removeEventListener('ghosthand-local-preview', previewHandler);
+      previewHandler = null;
+    }
+    previewActive.value = false;
+  }
+});
+
+onUnmounted(() => {
+  if (previewHandler) {
+    window.removeEventListener('ghosthand-local-preview', previewHandler);
+  }
 });
 
 // Lifecycle
@@ -444,57 +507,71 @@ async function handleSettingsUpdate(settings: any) {
   position: relative;
 }
 
-/* Écran contrôlé */
-.controlled-overlay {
+/* Écran contrôlé - preview */
+.controlled-view {
+  position: relative;
+  height: 100%;
+  background: #000;
+}
+
+.preview-canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.preview-waiting {
+  position: absolute;
+  inset: 0;
   display: flex;
   justify-content: center;
   align-items: center;
-  height: 100%;
-  background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
-}
-
-.controlled-content {
-  text-align: center;
-  color: #ccc;
-}
-
-.controlled-icon {
-  font-size: 64px;
-  margin-bottom: 20px;
-}
-
-.controlled-content h2 {
-  font-size: 22px;
-  margin-bottom: 10px;
-  color: #4ec9b0;
-}
-
-.controlled-content p {
+  color: #888;
   font-size: 14px;
-  color: #999;
-  margin-bottom: 30px;
 }
 
-.controlled-content code {
+.controlled-controls {
+  position: absolute;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 15px;
+  padding: 10px 20px;
+  background: rgba(0, 0, 0, 0.75);
+  border-radius: 10px;
+  backdrop-filter: blur(8px);
+}
+
+.controlled-badge {
+  font-size: 13px;
+  color: #ccc;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.controlled-badge code {
   color: #4ec9b0;
   font-family: monospace;
-  background: rgba(0, 0, 0, 0.3);
+  background: rgba(0, 0, 0, 0.4);
   padding: 2px 8px;
   border-radius: 3px;
 }
 
-.disconnect-btn-large {
-  padding: 12px 30px;
+.disconnect-btn-floating {
+  padding: 8px 20px;
   background: #c44;
   border: none;
   border-radius: 6px;
   color: #fff;
-  font-size: 15px;
+  font-size: 13px;
   cursor: pointer;
   transition: background 0.2s;
 }
 
-.disconnect-btn-large:hover {
+.disconnect-btn-floating:hover {
   background: #e55;
 }
 </style>

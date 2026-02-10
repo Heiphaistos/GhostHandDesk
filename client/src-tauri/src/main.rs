@@ -161,6 +161,15 @@ fn start_embedded_server() -> Option<(std::process::Child, std::path::PathBuf)> 
     None
 }
 
+/// Pair découvert sur le réseau local via UDP broadcast
+#[derive(Clone, Serialize)]
+struct DiscoveredPeer {
+    device_id: String,
+    ip: String,
+    port: u16,
+    last_seen: u64,
+}
+
 #[derive(Clone, Serialize)]
 struct ConnectionRequest {
     from: String,
@@ -174,6 +183,7 @@ struct AppState {
     config: Arc<Mutex<Config>>,
     pending_requests: Arc<Mutex<Vec<ConnectionRequest>>>,
     streamer_handle: Arc<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
+    discovered_peers: Arc<std::sync::Mutex<Vec<DiscoveredPeer>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -212,6 +222,111 @@ use storage_commands::{
     get_connection_history, get_known_peers, get_favorite_peers,
     set_peer_favorite, get_storage_stats,
 };
+
+/// Démarrer la découverte LAN via UDP broadcast
+fn start_lan_discovery(
+    device_id: String,
+    server_port: u16,
+    discovered_peers: Arc<std::sync::Mutex<Vec<DiscoveredPeer>>>,
+) {
+    const DISCOVERY_PORT: u16 = 19876;
+    const BROADCAST_INTERVAL_SECS: u64 = 3;
+
+    // Thread d'envoi : broadcast UDP toutes les 3 secondes
+    let device_id_send = device_id.clone();
+    std::thread::spawn(move || {
+        let socket = match std::net::UdpSocket::bind("0.0.0.0:0") {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[DISCOVERY] Impossible de créer le socket d'envoi: {}", e);
+                return;
+            }
+        };
+        let _ = socket.set_broadcast(true);
+        let msg = format!("GHD|{}|{}", device_id_send, server_port);
+        loop {
+            let _ = socket.send_to(msg.as_bytes(), format!("255.255.255.255:{}", DISCOVERY_PORT));
+            std::thread::sleep(std::time::Duration::from_secs(BROADCAST_INTERVAL_SECS));
+        }
+    });
+
+    // Thread de réception : écouter les broadcasts des autres instances
+    let own_device_id = device_id;
+    std::thread::spawn(move || {
+        let socket = match std::net::UdpSocket::bind(format!("0.0.0.0:{}", DISCOVERY_PORT)) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[DISCOVERY] Impossible de bind le listener (port {}): {}", DISCOVERY_PORT, e);
+                return;
+            }
+        };
+        let mut buf = [0u8; 512];
+        println!("[DISCOVERY] Écoute sur port {}", DISCOVERY_PORT);
+        loop {
+            match socket.recv_from(&mut buf) {
+                Ok((len, src)) => {
+                    let msg = String::from_utf8_lossy(&buf[..len]);
+                    if let Some(rest) = msg.strip_prefix("GHD|") {
+                        let parts: Vec<&str> = rest.split('|').collect();
+                        if parts.len() >= 2 {
+                            let peer_id = parts[0];
+                            // Ignorer son propre broadcast
+                            if peer_id == own_device_id {
+                                continue;
+                            }
+                            let peer_port: u16 = parts[1].parse().unwrap_or(9000);
+                            let peer_ip = src.ip().to_string();
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+
+                            if let Ok(mut peers) = discovered_peers.lock() {
+                                // Nettoyer les peers plus vus depuis 15 secondes
+                                peers.retain(|p| now - p.last_seen < 15);
+                                // Mettre à jour ou ajouter
+                                if let Some(existing) = peers.iter_mut().find(|p| p.device_id == peer_id) {
+                                    existing.last_seen = now;
+                                    existing.ip = peer_ip;
+                                    existing.port = peer_port;
+                                } else {
+                                    println!("[DISCOVERY] Nouveau pair: {} @ {}:{}", peer_id, peer_ip, peer_port);
+                                    peers.push(DiscoveredPeer {
+                                        device_id: peer_id.to_string(),
+                                        ip: peer_ip,
+                                        port: peer_port,
+                                        last_seen: now,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[DISCOVERY] Erreur réception: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Récupérer les pairs découverts sur le réseau local
+#[tauri::command]
+fn get_discovered_peers(state: State<AppState>) -> Vec<DiscoveredPeer> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    if let Ok(mut peers) = state.discovered_peers.lock() {
+        // Retirer les peers plus vus depuis 15 secondes
+        peers.retain(|p| now - p.last_seen < 15);
+        peers.clone()
+    } else {
+        Vec::new()
+    }
+}
 
 /// Nettoyer les requêtes de connexion expirées
 fn cleanup_old_requests(requests: &mut Vec<ConnectionRequest>) {
@@ -548,13 +663,27 @@ async fn start_streaming(
 
             diag_log("start_streaming: capturer + encoder OK");
 
-            // Créer streamer
-            let streamer = Streamer::new(
+            // Récupérer la fenêtre pour le callback local (preview)
+            let preview_window = app_handle.get_webview_window("main");
+
+            // Créer streamer avec callback local pour le preview sur le PC contrôlé
+            let mut streamer = Streamer::new(
                 capturer,
                 encoder,
                 webrtc.clone(),
                 30,
             );
+
+            if let Some(pw) = preview_window {
+                streamer = streamer.with_local_callback(move |data, width, height, timestamp| {
+                    let b64_data = base64::engine::general_purpose::STANDARD.encode(&data);
+                    let js_code = format!(
+                        "window.dispatchEvent(new CustomEvent('ghosthand-local-preview', {{ detail: {{ data: '{}', width: {}, height: {}, timestamp: {} }} }}));",
+                        b64_data, width, height, timestamp
+                    );
+                    let _ = pw.eval(&js_code);
+                });
+            }
 
             // Lancer dans un task local et stocker le handle
             let handle = tauri::async_runtime::spawn(async move {
@@ -907,6 +1036,21 @@ fn main() {
     println!("🌐 Serveur: {}", config.server_url);
     println!("==============================================");
 
+    // Extraire le port du serveur pour la discovery
+    let server_port: u16 = config.server_url
+        .split(':')
+        .last()
+        .and_then(|s| s.split('/').next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(9000);
+
+    // Créer le store de peers découverts
+    let discovered_peers: Arc<std::sync::Mutex<Vec<DiscoveredPeer>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    // Lancer la découverte LAN
+    start_lan_discovery(device_id.clone(), server_port, discovered_peers.clone());
+
     // Créer l'état global
     let app_state = AppState {
         device_id: device_id.clone(),
@@ -914,6 +1058,7 @@ fn main() {
         config: Arc::new(Mutex::new(config)),
         pending_requests: Arc::new(Mutex::new(Vec::new())),
         streamer_handle: Arc::new(Mutex::new(None)),
+        discovered_peers,
     };
 
     // Cloner pour les closures
@@ -935,6 +1080,7 @@ fn main() {
             get_config,
             update_config,
             update_server_url,
+            get_discovered_peers,
             start_streaming,
             stop_streaming,
             start_receiving,

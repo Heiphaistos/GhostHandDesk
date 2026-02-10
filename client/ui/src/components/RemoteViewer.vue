@@ -276,20 +276,14 @@ function handleVideoFrame(payload: VideoFramePayload) {
     }
   }
 
-  // Décoder et dessiner
+  // Décoder avec createImageBitmap (plus rapide que new Image + blob URL)
   try {
     const blob = new Blob([new Uint8Array(payload.data)], { type: 'image/jpeg' });
-    const url = URL.createObjectURL(blob);
-
-    const img = new Image();
-    img.onload = () => {
+    createImageBitmap(blob).then((bmp) => {
       const dr = drawRect.value;
-      // Effacer le canvas (barres noires)
       ctx.clearRect(0, 0, canvas.width, canvas.height);
-      // Dessiner l'image dans la zone calculée (ratio préservé)
-      ctx.drawImage(img, dr.x, dr.y, dr.w, dr.h);
-
-      URL.revokeObjectURL(url);
+      ctx.drawImage(bmp, dr.x, dr.y, dr.w, dr.h);
+      bmp.close();
 
       if (!streaming.value) {
         streaming.value = true;
@@ -299,14 +293,9 @@ function handleVideoFrame(payload: VideoFramePayload) {
 
       const now = Date.now();
       latency.value = Math.max(0, now - payload.timestamp);
-    };
-
-    img.onerror = (err) => {
-      console.error('[SÉCURITÉ] Erreur chargement image:', err);
-      URL.revokeObjectURL(url);
-    };
-
-    img.src = url;
+    }).catch((err) => {
+      console.error('[SÉCURITÉ] Erreur décodage image:', err);
+    });
   } catch (error) {
     console.error('[SÉCURITÉ] Erreur traitement frame:', error);
   }

@@ -30,6 +30,9 @@ fn stream_diag(msg: &str) {
     }
 }
 
+/// Callback pour recevoir les frames localement (preview sur le PC contrôlé)
+pub type LocalFrameCallback = Arc<dyn Fn(Vec<u8>, u32, u32, u64) + Send + Sync>;
+
 /// Streamer principal : capture → encode → send
 pub struct Streamer {
     capturer: Arc<Mutex<Box<dyn ScreenCapturer>>>,
@@ -38,6 +41,7 @@ pub struct Streamer {
     framerate: u32,
     running: Arc<AtomicBool>,
     adaptive_controller: Option<Arc<Mutex<AdaptiveBitrateController>>>,
+    local_frame_callback: Option<LocalFrameCallback>,
 }
 
 impl Streamer {
@@ -55,12 +59,22 @@ impl Streamer {
             framerate,
             running: Arc::new(AtomicBool::new(false)),
             adaptive_controller: None,
+            local_frame_callback: None,
         }
     }
 
     /// Activer le contrôle adaptatif du bitrate
     pub fn with_adaptive_bitrate(mut self, controller: AdaptiveBitrateController) -> Self {
         self.adaptive_controller = Some(Arc::new(Mutex::new(controller)));
+        self
+    }
+
+    /// Ajouter un callback local pour le preview (PC contrôlé)
+    pub fn with_local_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(Vec<u8>, u32, u32, u64) + Send + Sync + 'static,
+    {
+        self.local_frame_callback = Some(Arc::new(callback));
         self
     }
 
@@ -120,6 +134,14 @@ impl Streamer {
                     }
                 }
             }; // encoder_guard est drop ici
+
+            // 2.5 Envoyer au callback local (preview sur le PC contrôlé)
+            // Limité à ~10 FPS (1 frame sur 3 à 30 FPS) pour ne pas surcharger
+            if let Some(ref cb) = self.local_frame_callback {
+                if frame_count % 3 == 0 {
+                    cb(encoded.data.clone(), encoded.width, encoded.height, encoded.timestamp);
+                }
+            }
 
             // 3. Créer le message ControlMessage
             let message = ControlMessage::VideoFrame {
