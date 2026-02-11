@@ -19,7 +19,7 @@
           </button>
         </div>
         <div v-if="networkInfo.local_ip" class="network-info">
-          <span class="label">IP:</span>
+          <span class="ip-label">IP:</span>
           <code class="network-ip">{{ networkInfo.local_ip }}:{{ networkInfo.port }}</code>
         </div>
       </div>
@@ -54,6 +54,7 @@
       <RemoteViewer
         v-else-if="!isControlled"
         :connection-id="connectedTo"
+        :device-id="deviceId"
         @disconnect="handleDisconnect"
       />
 

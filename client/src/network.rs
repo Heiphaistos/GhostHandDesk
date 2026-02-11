@@ -558,8 +558,8 @@ impl WebRTCConnection {
     }
 
     /// Send data over the data channel
-    /// Taille max d'un chunk WebRTC (16KB - marge pour header)
-    const MAX_CHUNK_SIZE: usize = 15 * 1024;
+    /// Taille max d'un chunk WebRTC (60KB - safe limit, WebRTC max ~256KB)
+    const MAX_CHUNK_SIZE: usize = 60 * 1024;
 
     pub async fn send_data(&self, data: &[u8]) -> Result<()> {
         let dc_lock = self.data_channel.read().await;
@@ -572,12 +572,15 @@ impl WebRTCConnection {
                     .map_err(|e| GhostHandError::WebRTC(format!("Erreur d'envoi de données: {}", e)))?;
             } else {
                 // Message trop gros : fragmenter
+                // PERF: Pré-construire tous les buffers puis les envoyer en batch
+                let mut messages: Vec<Bytes> = Vec::new();
+
                 // Header: [0xFF][0x01][total_len: u32 LE]
-                let mut header = vec![0xFF, 0x01];
+                let mut header = Vec::with_capacity(6);
+                header.push(0xFF);
+                header.push(0x01);
                 header.extend_from_slice(&(data.len() as u32).to_le_bytes());
-                dc.send(&Bytes::from(header))
-                    .await
-                    .map_err(|e| GhostHandError::WebRTC(format!("Erreur envoi header chunk: {}", e)))?;
+                messages.push(Bytes::from(header));
 
                 // Chunks de données: [0xFF][0x02][data...]
                 for chunk in data.chunks(Self::MAX_CHUNK_SIZE) {
@@ -585,7 +588,12 @@ impl WebRTCConnection {
                     chunk_msg.push(0xFF);
                     chunk_msg.push(0x02);
                     chunk_msg.extend_from_slice(chunk);
-                    dc.send(&Bytes::from(chunk_msg))
+                    messages.push(Bytes::from(chunk_msg));
+                }
+
+                // Envoyer tous les messages d'un coup (un seul verrouillage du DC)
+                for msg in messages {
+                    dc.send(&msg)
                         .await
                         .map_err(|e| GhostHandError::WebRTC(format!("Erreur envoi chunk: {}", e)))?;
                 }

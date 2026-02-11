@@ -194,8 +194,8 @@ impl ScreenCapturer for XCapCapturer {
                 Display {
                     id: idx as u32,
                     name: format!("Monitor {}", idx),
-                    width: monitor.width() as u32,
-                    height: monitor.height() as u32,
+                    width: monitor.width(),
+                    height: monitor.height(),
                     x: monitor.x(),
                     y: monitor.y(),
                     is_primary: idx == 0,
@@ -223,7 +223,7 @@ impl ScreenCapturer for XCapCapturer {
     fn get_resolution(&self) -> (u32, u32) {
         if let Some(idx) = self.current_monitor {
             if let Some(monitor) = self.monitors.get(idx) {
-                return (monitor.width() as u32, monitor.height() as u32);
+                return (monitor.width(), monitor.height());
             }
         }
         (1920, 1080) // Fallback

@@ -4,9 +4,11 @@
 
 pub mod adaptive_bitrate;
 pub mod audit;
+pub mod clipboard;
 pub mod config;
 pub mod crypto;
 pub mod error;
+pub mod file_transfer;
 pub mod input_control;
 pub mod network;
 pub mod protocol;

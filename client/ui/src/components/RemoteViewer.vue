@@ -16,10 +16,24 @@
         <div class="stats">
           <span class="stat">FPS: {{ fps }}</span>
           <span class="stat">Latence: {{ latency }}ms</span>
+          <span class="stat">{{ bandwidthKBs }} KB/s</span>
+          <span class="stat">Frame: {{ avgFrameSize }} KB</span>
         </div>
       </div>
 
       <div class="toolbar-right">
+        <!-- Multi-monitor selector -->
+        <select v-if="displays.length > 1" v-model="selectedDisplay" @change="changeDisplay" class="display-select" title="Ecran">
+          <option v-for="d in displays" :key="d.id" :value="d.id">
+            {{ d.name || ('Ecran ' + (d.id + 1)) }} ({{ d.width }}x{{ d.height }})
+          </option>
+        </select>
+        <button @click="handleSyncClipboard" class="toolbar-btn" title="Sync presse-papiers">
+          <span>📋</span>
+        </button>
+        <button @click="chatOpen = !chatOpen" class="toolbar-btn" title="Chat">
+          <span>💬</span>
+        </button>
         <button @click="toggleFullscreen" class="toolbar-btn" title="Plein écran">
           <span>{{ isFullscreen ? '🗗' : '🗖' }}</span>
         </button>
@@ -82,6 +96,15 @@
       <div class="fps-indicator" :class="{ 'fps-low': fps < 20 }">
         {{ fps }} FPS
       </div>
+
+      <!-- Chat Panel -->
+      <ChatPanel
+        ref="chatPanelRef"
+        :is-open="chatOpen"
+        :device-id="deviceId"
+        :connected="streaming"
+        @toggle="chatOpen = !chatOpen"
+      />
     </div>
   </div>
 </template>
@@ -89,10 +112,12 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
+import ChatPanel from './ChatPanel.vue';
 
 // Props
 interface Props {
   connectionId: string;
+  deviceId: string;
 }
 
 const props = defineProps<Props>();
@@ -105,6 +130,7 @@ const emit = defineEmits<{
 // Refs
 const canvasRef = ref<HTMLCanvasElement | null>(null);
 const containerRef = ref<HTMLDivElement | null>(null);
+const chatPanelRef = ref<InstanceType<typeof ChatPanel> | null>(null);
 
 // État
 const streaming = ref(false);
@@ -113,6 +139,24 @@ const latency = ref(0);
 const quality = ref('medium');
 const showQuality = ref(false);
 const isFullscreen = ref(false);
+const chatOpen = ref(false);
+
+// Stats de qualité
+const bandwidthKBs = ref(0);
+const avgFrameSize = ref(0);
+
+// Multi-monitor
+interface DisplayInfo {
+  id: number;
+  name: string;
+  width: number;
+  height: number;
+  x: number;
+  y: number;
+  is_primary: boolean;
+}
+const displays = ref<DisplayInfo[]>([]);
+const selectedDisplay = ref(0);
 
 // Dimensions de l'écran distant et zone de dessin réelle dans le canvas
 const remoteWidth = ref(0);
@@ -124,7 +168,13 @@ let frameCount = 0;
 let lastFpsUpdate = Date.now();
 let fpsIntervalId: ReturnType<typeof setInterval> | null = null;
 let videoEventHandler: ((event: Event) => void) | null = null;
+let chatEventHandler: ((event: Event) => void) | null = null;
+let clipboardEventHandler: ((event: Event) => void) | null = null;
+let displayListHandler: ((event: Event) => void) | null = null;
 let resizeObserver: ResizeObserver | null = null;
+let lastMouseMoveTime = 0; // Throttle MouseMove à 60Hz
+let totalBytesReceived = 0;
+let frameSizes: number[] = [];
 
 // Lifecycle
 onMounted(async () => {
@@ -153,6 +203,33 @@ onMounted(async () => {
   window.addEventListener('ghosthand-video-frame', videoEventHandler);
   console.log('Listener vidéo configuré (CustomEvent)');
 
+  // Écouter les messages de chat via CustomEvent
+  chatEventHandler = ((event: Event) => {
+    if (chatPanelRef.value) {
+      chatPanelRef.value.handleChatMessage(event);
+    }
+  });
+  window.addEventListener('ghosthand-chat-message', chatEventHandler);
+
+  // Écouter les sync clipboard via CustomEvent
+  clipboardEventHandler = ((event: Event) => {
+    const { content } = (event as CustomEvent).detail;
+    if (content) {
+      invoke('set_clipboard', { content }).catch(() => {});
+    }
+  });
+  window.addEventListener('ghosthand-clipboard-sync', clipboardEventHandler);
+
+  // Écouter la liste d'écrans distants via CustomEvent
+  displayListHandler = ((event: Event) => {
+    const list = (event as CustomEvent).detail;
+    if (Array.isArray(list)) {
+      displays.value = list;
+      console.log('[VIEWER] Display list reçue:', list.length, 'écrans');
+    }
+  });
+  window.addEventListener('ghosthand-display-list', displayListHandler);
+
   // Observer les changements de taille du container
   if (containerRef.value) {
     resizeObserver = new ResizeObserver(() => {
@@ -168,6 +245,15 @@ onMounted(async () => {
 onUnmounted(() => {
   if (videoEventHandler) {
     window.removeEventListener('ghosthand-video-frame', videoEventHandler);
+  }
+  if (chatEventHandler) {
+    window.removeEventListener('ghosthand-chat-message', chatEventHandler);
+  }
+  if (clipboardEventHandler) {
+    window.removeEventListener('ghosthand-clipboard-sync', clipboardEventHandler);
+  }
+  if (displayListHandler) {
+    window.removeEventListener('ghosthand-display-list', displayListHandler);
   }
   if (fpsIntervalId) {
     clearInterval(fpsIntervalId);
@@ -290,6 +376,8 @@ function handleVideoFrame(payload: VideoFramePayload) {
       }
 
       frameCount++;
+      totalBytesReceived += payload.data.length;
+      frameSizes.push(payload.data.length);
 
       const now = Date.now();
       latency.value = Math.max(0, now - payload.timestamp);
@@ -307,7 +395,16 @@ function updateFps() {
 
   fps.value = Math.round(frameCount / elapsed);
 
+  // Bandwidth stats
+  bandwidthKBs.value = Math.round(totalBytesReceived / 1024 / elapsed);
+  if (frameSizes.length > 0) {
+    const avg = frameSizes.reduce((a, b) => a + b, 0) / frameSizes.length;
+    avgFrameSize.value = Math.round(avg / 1024);
+  }
+
   frameCount = 0;
+  totalBytesReceived = 0;
+  frameSizes = [];
   lastFpsUpdate = now;
 }
 
@@ -384,6 +481,11 @@ async function handleMouseUp(event: MouseEvent) {
 }
 
 async function handleMouseMove(event: MouseEvent) {
+  // Throttle à 60Hz (16ms) pour ne pas saturer le data channel
+  const now = Date.now();
+  if (now - lastMouseMoveTime < 16) return;
+  lastMouseMoveTime = now;
+
   const coords = canvasToRemote(event);
   if (!coords) return;
 
@@ -518,6 +620,24 @@ async function updateQuality() {
     console.log(`[VIEWER] Qualité mise à jour: ${quality.value}`, preset);
   } catch (error) {
     console.error('Erreur mise à jour qualité:', error);
+  }
+}
+
+async function handleSyncClipboard() {
+  try {
+    const content = await invoke<string>('sync_clipboard');
+    console.log('[VIEWER] Clipboard synchronisé:', content.length, 'chars');
+  } catch (error) {
+    console.error('Erreur sync clipboard:', error);
+  }
+}
+
+async function changeDisplay() {
+  try {
+    await invoke('change_display', { displayId: selectedDisplay.value });
+    console.log('[VIEWER] SelectDisplay envoyé:', selectedDisplay.value);
+  } catch (error) {
+    console.error('Erreur changement écran:', error);
   }
 }
 </script>
@@ -754,5 +874,21 @@ async function updateQuality() {
 
 .fps-indicator.fps-low {
   color: #ffa500;
+}
+
+/* Display selector */
+.display-select {
+  padding: 4px 8px;
+  background: #3c3c3c;
+  border: 1px solid #555;
+  border-radius: 4px;
+  color: #ccc;
+  font-size: 12px;
+  cursor: pointer;
+  outline: none;
+}
+
+.display-select:focus {
+  border-color: #0e639c;
 }
 </style>

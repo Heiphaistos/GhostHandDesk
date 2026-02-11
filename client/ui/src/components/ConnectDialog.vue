@@ -230,9 +230,20 @@ onMounted(async () => {
 });
 
 // Méthodes
-function handleSubmit() {
+async function handleSubmit() {
   if (!targetId.value.trim()) return;
-  emit('connect', targetId.value.trim(), password.value.trim() || null);
+
+  // Auto-détection : chercher si le Device ID existe dans les peers découverts
+  const target = targetId.value.trim();
+  const matchedPeer = discoveredPeers.value.find(p => p.device_id === target);
+
+  if (matchedPeer) {
+    // Peer trouvé sur le LAN → auto-configurer le serveur si nécessaire
+    await connectToPeer(matchedPeer);
+  } else {
+    // Peer non trouvé → utiliser le serveur actuel (localhost ou configuré)
+    emit('connect', target, password.value.trim() || null);
+  }
 }
 
 async function handleChangeServer() {

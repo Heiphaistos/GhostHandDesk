@@ -217,7 +217,7 @@ impl ClientRateLimiter {
             .or_insert_with(VecDeque::new);
 
         // Nettoyer les anciennes entrées
-        while history.front().map_or(false, |&time| time < cutoff) {
+        while history.front().is_some_and(|&time| time < cutoff) {
             history.pop_front();
         }
 

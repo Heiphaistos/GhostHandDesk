@@ -100,8 +100,22 @@ impl VideoEncoder for ImageEncoder {
             }
         };
 
-        // Convert RGBA to RGB (JPEG doesn't support alpha)
-        let rgb_img = image::DynamicImage::ImageRgba8(img).to_rgb8();
+        // Convert RGBA to DynamicImage for potential downscale
+        let dynamic_img = image::DynamicImage::ImageRgba8(img);
+
+        // PERF: Downscale to 1280x720 if source is larger (reduces JPEG size ~60%)
+        let (final_img, out_width, out_height) = if frame.width > 1280 {
+            let scale = 1280.0 / frame.width as f64;
+            let new_h = (frame.height as f64 * scale) as u32;
+            let resized = dynamic_img.resize_exact(1280, new_h, image::imageops::FilterType::Nearest);
+            let w = resized.width();
+            let h = resized.height();
+            (resized.to_rgb8(), w, h)
+        } else {
+            let w = dynamic_img.width();
+            let h = dynamic_img.height();
+            (dynamic_img.to_rgb8(), w, h)
+        };
 
         // Encode to JPEG
         let mut buffer = Vec::new();
@@ -109,9 +123,9 @@ impl VideoEncoder for ImageEncoder {
 
         image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, self.quality)
             .encode(
-                &rgb_img,
-                frame.width,
-                frame.height,
+                &final_img,
+                out_width,
+                out_height,
                 image::ExtendedColorType::Rgb8,
             )
             .map_err(|e| {
@@ -122,8 +136,8 @@ impl VideoEncoder for ImageEncoder {
             data: buffer,
             timestamp: frame.timestamp,
             is_keyframe: true, // JPEG frames are always keyframes
-            width: frame.width,
-            height: frame.height,
+            width: out_width,
+            height: out_height,
         })
     }
 
@@ -428,8 +442,9 @@ mod tests {
 
         let encoded = encoder.encode(&frame).await?;
         assert!(!encoded.data.is_empty());
-        assert_eq!(encoded.width, 1920);
-        assert_eq!(encoded.height, 1080);
+        // Downscale: 1920x1080 → 1280x720
+        assert_eq!(encoded.width, 1280);
+        assert_eq!(encoded.height, 720);
 
         Ok(())
     }

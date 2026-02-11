@@ -199,7 +199,7 @@ impl AuditLogger {
     /// Écrire une ligne dans le fichier de log avec rotation automatique
     fn write_to_file(&self, json: &str) -> std::io::Result<()> {
         let mut file_guard = self.file.lock().map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("Mutex poisoned: {}", e))
+            std::io::Error::other(format!("Mutex poisoned: {}", e))
         })?;
 
         if let Some(file) = file_guard.as_mut() {
@@ -210,7 +210,7 @@ impl AuditLogger {
                 drop(file_guard); // Libérer le lock
                 self.rotate_log()?;
                 file_guard = self.file.lock().map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::Other, format!("Mutex poisoned: {}", e))
+                    std::io::Error::other(format!("Mutex poisoned: {}", e))
                 })?;
             }
 
@@ -237,7 +237,7 @@ impl AuditLogger {
 
         // Fermer le fichier actuel
         *self.file.lock().map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("Mutex poisoned: {}", e))
+            std::io::Error::other(format!("Mutex poisoned: {}", e))
         })? = None;
 
         // Renommer
@@ -250,7 +250,7 @@ impl AuditLogger {
             .open(&self.log_path)?;
 
         *self.file.lock().map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("Mutex poisoned: {}", e))
+            std::io::Error::other(format!("Mutex poisoned: {}", e))
         })? = Some(new_file);
 
         info!("Audit log rotation effectuée: {}", archived_path.display());

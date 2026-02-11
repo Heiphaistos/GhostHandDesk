@@ -5,17 +5,20 @@ mod storage_commands;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::{Manager, State, AppHandle};
+use tauri::menu::{MenuBuilder, MenuItemBuilder};
+use tauri::tray::TrayIconBuilder;
 use tokio::sync::Mutex;
 use ghost_hand_client::audit::{audit_log, init_global_logger, AuditEvent, AuditLevel};
+use ghost_hand_client::clipboard::ClipboardManager;
 use ghost_hand_client::config::{Config, VideoCodec};
+use ghost_hand_client::file_transfer::FileTransferManager;
 use ghost_hand_client::network::{generate_device_id, SessionManager};
-use ghost_hand_client::protocol::ControlMessage;
+use ghost_hand_client::protocol::{ControlMessage, DisplayInfoProto};
 use ghost_hand_client::storage::{global_storage, init_global_storage, ConnectionHistory};
 use ghost_hand_client::streaming::{Streamer, Receiver, InputHandler};
-use ghost_hand_client::screen_capture;
+use ghost_hand_client::screen_capture::{self, ScreenCapturer};
 use ghost_hand_client::video_encoder;
 use base64::Engine;
-
 // Fonction de diagnostic - écrit dans un fichier log
 fn diag_log(msg: &str) {
     use std::io::Write;
@@ -177,6 +180,7 @@ struct ConnectionRequest {
     expires_at: u64,
 }
 
+#[allow(dead_code)]
 struct AppState {
     device_id: String,
     session_manager: Arc<Mutex<Option<SessionManager>>>,
@@ -184,6 +188,9 @@ struct AppState {
     pending_requests: Arc<Mutex<Vec<ConnectionRequest>>>,
     streamer_handle: Arc<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
     discovered_peers: Arc<std::sync::Mutex<Vec<DiscoveredPeer>>>,
+    clipboard_manager: Arc<std::sync::Mutex<ClipboardManager>>,
+    file_transfer_manager: Arc<Mutex<FileTransferManager>>,
+    active_capturer: Arc<Mutex<Option<Arc<Mutex<Box<dyn ScreenCapturer>>>>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -390,7 +397,7 @@ async fn get_network_info(state: State<'_, AppState>) -> Result<serde_json::Valu
     // Extraire le port du server_url
     let port = server_url
         .split(':')
-        .last()
+        .next_back()
         .and_then(|s| s.split('/').next())
         .unwrap_or("9000");
 
@@ -510,29 +517,33 @@ async fn send_mouse_event(
 
     if let Some(session) = session_guard.as_ref() {
         if let Some(webrtc) = &session.webrtc {
-            // Convertir en ControlMessage
-            let msg = match event.r#type.as_str() {
-                "move" => ControlMessage::MouseMove {
-                    x: event.x,
-                    y: event.y
+            match event.r#type.as_str() {
+                "move" => {
+                    let msg = ControlMessage::MouseMove { x: event.x, y: event.y };
+                    let bytes = msg.to_bytes().map_err(|e| format!("Erreur sérialisation: {}", e))?;
+                    webrtc.send_data(&bytes).await.map_err(|e| format!("Erreur envoi: {}", e))?;
                 },
-                "down" | "up" => ControlMessage::MouseClick {
-                    button: event.button.clone(),
-                    pressed: event.r#type == "down",
+                "down" | "up" => {
+                    // FIX: Envoyer MouseMove AVANT MouseClick pour positionner le curseur
+                    let move_msg = ControlMessage::MouseMove { x: event.x, y: event.y };
+                    let move_bytes = move_msg.to_bytes().map_err(|e| format!("Erreur sérialisation move: {}", e))?;
+                    webrtc.send_data(&move_bytes).await.map_err(|e| format!("Erreur envoi move: {}", e))?;
+
+                    let click_msg = ControlMessage::MouseClick {
+                        button: event.button.clone(),
+                        pressed: event.r#type == "down",
+                    };
+                    let click_bytes = click_msg.to_bytes().map_err(|e| format!("Erreur sérialisation click: {}", e))?;
+                    webrtc.send_data(&click_bytes).await.map_err(|e| format!("Erreur envoi click: {}", e))?;
                 },
-                "wheel" => ControlMessage::MouseScroll {
-                    delta: event.delta
+                "wheel" => {
+                    let msg = ControlMessage::MouseScroll { delta: event.delta };
+                    let bytes = msg.to_bytes().map_err(|e| format!("Erreur sérialisation: {}", e))?;
+                    webrtc.send_data(&bytes).await.map_err(|e| format!("Erreur envoi: {}", e))?;
                 },
                 _ => return Err("Unknown mouse event type".to_string()),
             };
 
-            // Envoyer via WebRTC
-            let bytes = msg.to_bytes().map_err(|e| format!("Erreur sérialisation: {}", e))?;
-            webrtc.send_data(&bytes)
-                .await
-                .map_err(|e| format!("Erreur envoi: {}", e))?;
-
-            println!("[TAURI] Mouse event envoyé: {} at ({}, {})", event.r#type, event.x, event.y);
             Ok(())
         } else {
             Err("Pas de connexion WebRTC".to_string())
@@ -654,7 +665,7 @@ async fn start_streaming(
                 diag_log(&format!("start_streaming: data_channel ERREUR: {}", e));
                 // Notifier l'UI
                 if let Some(w) = app_handle.get_webview_window("main") {
-                    let _ = w.eval(&format!("alert('STREAMING: Data channel non prêt: {}');", e));
+                    let _ = w.eval(format!("alert('STREAMING: Data channel non prêt: {}');", e));
                 }
             }
 
@@ -677,6 +688,31 @@ async fn start_streaming(
                 webrtc.clone(),
                 30,
             );
+
+            // Stocker le capturer partagé pour le switch de moniteur
+            let shared_capturer = streamer.capturer();
+            *state.active_capturer.lock().await = Some(shared_capturer.clone());
+
+            // Envoyer la liste d'écrans au viewer distant
+            {
+                let cap = shared_capturer.lock().await;
+                if let Ok(displays) = cap.get_displays() {
+                    let display_infos: Vec<DisplayInfoProto> = displays.iter().map(|d| {
+                        DisplayInfoProto {
+                            id: d.id,
+                            name: d.name.clone(),
+                            width: d.width,
+                            height: d.height,
+                            is_primary: d.is_primary,
+                        }
+                    }).collect();
+                    let msg = ControlMessage::DisplayListResponse { displays: display_infos };
+                    if let Ok(bytes) = msg.to_bytes() {
+                        let _ = webrtc.send_data(&bytes).await;
+                        diag_log(&format!("start_streaming: display list envoyée ({} écrans)", displays.len()));
+                    }
+                }
+            }
 
             if let Some(pw) = preview_window {
                 streamer = streamer.with_local_callback(move |data, width, height, timestamp| {
@@ -749,27 +785,66 @@ async fn start_receiving(
             // Créer receiver
             let receiver = Arc::new(Receiver::new(webrtc.clone()));
 
-            // Démarrer avec callback pour émettre les frames à l'UI
+            // Fenêtre pour les messages non-vidéo (display list, chat, clipboard)
+            let msg_window = app_handle.get_webview_window("main");
+
+            // Démarrer avec callbacks séparés pour vidéo et messages de contrôle
             let frame_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let frame_counter_clone = frame_counter.clone();
-            receiver.start(move |data, width, height, timestamp| {
-                let count = frame_counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if count < 3 {
-                    diag_log(&format!("RECEIVER: Frame #{} reçue: {}x{} ({} bytes)", count, width, height, data.len()));
-                }
-                if count == 0 {
-                    // Première frame - alerte pour confirmer
-                    let _ = window.eval("document.title = 'FRAME REÇUE!';");
-                }
-                let b64_data = base64::engine::general_purpose::STANDARD.encode(&data);
-                let js_code = format!(
-                    "window.dispatchEvent(new CustomEvent('ghosthand-video-frame', {{ detail: {{ data: '{}', width: {}, height: {}, timestamp: {} }} }}));",
-                    b64_data, width, height, timestamp
-                );
-                if let Err(e) = window.eval(&js_code) {
-                    diag_log(&format!("RECEIVER: eval erreur: {}", e));
-                }
-            }).await
+            receiver.start_with_message_handler(
+                move |data, width, height, timestamp| {
+                    let count = frame_counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if count < 3 {
+                        diag_log(&format!("RECEIVER: Frame #{} reçue: {}x{} ({} bytes)", count, width, height, data.len()));
+                    }
+                    if count == 0 {
+                        let _ = window.eval("document.title = 'FRAME REÇUE!';");
+                    }
+                    let b64_data = base64::engine::general_purpose::STANDARD.encode(&data);
+                    let js_code = format!(
+                        "window.dispatchEvent(new CustomEvent('ghosthand-video-frame', {{ detail: {{ data: '{}', width: {}, height: {}, timestamp: {} }} }}));",
+                        b64_data, width, height, timestamp
+                    );
+                    if let Err(e) = window.eval(&js_code) {
+                        diag_log(&format!("RECEIVER: eval erreur: {}", e));
+                    }
+                },
+                move |msg| {
+                    // Dispatcher les messages non-vidéo vers l'UI via CustomEvents
+                    if let Some(ref w) = msg_window {
+                        match &msg {
+                            ControlMessage::DisplayListResponse { displays } => {
+                                if let Ok(json) = serde_json::to_string(displays) {
+                                    let js = format!(
+                                        "window.dispatchEvent(new CustomEvent('ghosthand-display-list', {{ detail: {} }}));",
+                                        json
+                                    );
+                                    let _ = w.eval(&js);
+                                }
+                            }
+                            ControlMessage::ChatMessage { from, text, timestamp } => {
+                                let js = format!(
+                                    "window.dispatchEvent(new CustomEvent('ghosthand-chat-message', {{ detail: {{ from: '{}', text: '{}', timestamp: {} }} }}));",
+                                    from.replace('\'', "\\'"),
+                                    text.replace('\'', "\\'"),
+                                    timestamp
+                                );
+                                let _ = w.eval(&js);
+                            }
+                            ControlMessage::ClipboardSync { content } => {
+                                let js = format!(
+                                    "window.dispatchEvent(new CustomEvent('ghosthand-clipboard-sync', {{ detail: {{ content: '{}' }} }}));",
+                                    content.replace('\'', "\\'")
+                                );
+                                let _ = w.eval(&js);
+                            }
+                            other => {
+                                println!("[RECEIVER] Message non géré: {:?}", other);
+                            }
+                        }
+                    }
+                },
+            ).await
                 .map_err(|e| {
                     diag_log(&format!("start_receiving: ERREUR receiver.start: {}", e));
                     format!("Erreur receiver: {}", e)
@@ -788,6 +863,7 @@ async fn start_receiving(
 }
 
 /// Démarrer le handler d'input (côté contrôlé)
+/// Gère les messages input (souris, clavier) + SelectDisplay pour le switch de moniteur
 #[tauri::command]
 async fn start_input_handler(
     state: State<'_, AppState>,
@@ -798,15 +874,44 @@ async fn start_input_handler(
 
     if let Some(session) = session_guard.as_ref() {
         if let Some(webrtc) = &session.webrtc {
-            // Créer input handler
             let handler = Arc::new(InputHandler::new()
                 .map_err(|e| format!("Erreur création handler: {}", e))?);
 
-            // Attacher au WebRTC
-            handler.attach_to_webrtc(Arc::new(Mutex::new(webrtc.clone()))).await
-                .map_err(|e| format!("Erreur attachement handler: {}", e))?;
+            // Setup manuel du data channel callback (au lieu de attach_to_webrtc)
+            // pour pouvoir aussi gérer SelectDisplay
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
-            println!("[TAURI] Input handler démarré");
+            webrtc.on_data_channel_message(move |data: &[u8]| {
+                let _ = tx.send(data.to_vec());
+            }).await.map_err(|e| format!("Erreur callback: {}", e))?;
+
+            let handler_clone = handler.clone();
+            let capturer_ref = state.active_capturer.clone();
+
+            tokio::spawn(async move {
+                while let Some(data) = rx.recv().await {
+                    if let Ok(msg) = ControlMessage::from_bytes(&data) {
+                        match msg {
+                            ControlMessage::SelectDisplay { display_id } => {
+                                // Switch de moniteur
+                                let cap_opt = capturer_ref.lock().await;
+                                if let Some(ref cap) = *cap_opt {
+                                    let mut cap_guard = cap.lock().await;
+                                    match cap_guard.select_display(display_id) {
+                                        Ok(_) => println!("[INPUT] Moniteur switché → {}", display_id),
+                                        Err(e) => println!("[INPUT] Erreur switch moniteur: {}", e),
+                                    }
+                                }
+                            }
+                            other => {
+                                let _ = handler_clone.handle_message(other).await;
+                            }
+                        }
+                    }
+                }
+            });
+
+            println!("[TAURI] Input handler démarré (avec support multi-monitor)");
             Ok(())
         } else {
             Err("Pas de connexion WebRTC".to_string())
@@ -942,7 +1047,7 @@ async fn start_listening_for_requests(
 
                             // Nettoyer les vieilles requêtes avant d'ajouter la nouvelle
                             let mut requests_guard = pending_requests.lock().await;
-                            cleanup_old_requests(&mut *requests_guard);
+                            cleanup_old_requests(&mut requests_guard);
                             requests_guard.push(request.clone());
                             drop(requests_guard); // Libérer explicitement le lock
 
@@ -975,6 +1080,161 @@ async fn start_listening_for_requests(
 
     println!("[TAURI] Écoute démarrée en arrière-plan");
     Ok(())
+}
+
+/// Synchroniser le presse-papiers : lire le clipboard local et l'envoyer au peer distant
+#[tauri::command]
+async fn sync_clipboard(state: State<'_, AppState>) -> Result<String, String> {
+    let content = {
+        let cm = state.clipboard_manager.lock().map_err(|e| format!("Lock erreur: {}", e))?;
+        cm.get_clipboard().map_err(|e| format!("Erreur clipboard: {}", e))?
+    };
+
+    // Envoyer via WebRTC si connecté
+    let session_guard = state.session_manager.lock().await;
+    if let Some(session) = session_guard.as_ref() {
+        if let Some(webrtc) = &session.webrtc {
+            let msg = ControlMessage::ClipboardSync { content: content.clone() };
+            let bytes = msg.to_bytes().map_err(|e| format!("Erreur sérialisation: {}", e))?;
+            webrtc.send_data(&bytes).await.map_err(|e| format!("Erreur envoi: {}", e))?;
+        }
+    }
+
+    Ok(content)
+}
+
+/// Récupérer le contenu du presse-papiers
+#[tauri::command]
+fn get_clipboard(state: State<AppState>) -> Result<String, String> {
+    let cm = state.clipboard_manager.lock().map_err(|e| format!("Lock erreur: {}", e))?;
+    cm.get_clipboard().map_err(|e| format!("Erreur: {}", e))
+}
+
+/// Définir le contenu du presse-papiers
+#[tauri::command]
+fn set_clipboard(state: State<AppState>, content: String) -> Result<(), String> {
+    let cm = state.clipboard_manager.lock().map_err(|e| format!("Lock erreur: {}", e))?;
+    cm.set_clipboard(&content).map_err(|e| format!("Erreur: {}", e))
+}
+
+/// Envoyer un message de chat
+#[tauri::command]
+async fn send_chat_message(
+    state: State<'_, AppState>,
+    text: String,
+) -> Result<(), String> {
+    let session_guard = state.session_manager.lock().await;
+    if let Some(session) = session_guard.as_ref() {
+        if let Some(webrtc) = &session.webrtc {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+
+            let msg = ControlMessage::ChatMessage {
+                from: state.device_id.clone(),
+                text,
+                timestamp,
+            };
+            let bytes = msg.to_bytes().map_err(|e| format!("Erreur sérialisation: {}", e))?;
+            webrtc.send_data(&bytes).await.map_err(|e| format!("Erreur envoi: {}", e))?;
+            Ok(())
+        } else {
+            Err("Pas de connexion WebRTC".to_string())
+        }
+    } else {
+        Err("Non connecté".to_string())
+    }
+}
+
+/// Demander au PC contrôlé de changer d'écran (côté viewer)
+#[tauri::command]
+async fn change_display(
+    state: State<'_, AppState>,
+    display_id: u32,
+) -> Result<(), String> {
+    let session_guard = state.session_manager.lock().await;
+    if let Some(session) = session_guard.as_ref() {
+        if let Some(webrtc) = &session.webrtc {
+            let msg = ControlMessage::SelectDisplay { display_id };
+            let bytes = msg.to_bytes().map_err(|e| format!("Erreur sérialisation: {}", e))?;
+            webrtc.send_data(&bytes).await.map_err(|e| format!("Erreur envoi: {}", e))?;
+            println!("[TAURI] SelectDisplay envoyé: {}", display_id);
+            Ok(())
+        } else {
+            Err("Pas de connexion WebRTC".to_string())
+        }
+    } else {
+        Err("Non connecté".to_string())
+    }
+}
+
+/// Récupérer la liste des écrans disponibles (locaux)
+#[tauri::command]
+fn get_displays() -> Result<Vec<serde_json::Value>, String> {
+    let monitors = xcap::Monitor::all().map_err(|e| format!("Erreur moniteurs: {}", e))?;
+    let displays: Vec<serde_json::Value> = monitors.iter().enumerate().map(|(i, m)| {
+        serde_json::json!({
+            "id": i,
+            "name": m.name(),
+            "width": m.width(),
+            "height": m.height(),
+            "x": m.x(),
+            "y": m.y(),
+            "is_primary": m.is_primary(),
+        })
+    }).collect();
+    Ok(displays)
+}
+
+/// Envoyer un fichier au peer distant
+#[tauri::command]
+async fn send_file(
+    state: State<'_, AppState>,
+    file_path: String,
+) -> Result<(), String> {
+    let path = std::path::Path::new(&file_path);
+    if !path.exists() {
+        return Err("Fichier non trouvé".to_string());
+    }
+
+    let (id, name, size, chunks) = ghost_hand_client::file_transfer::FileTransferManager::prepare_send(path)
+        .map_err(|e| format!("Erreur préparation: {}", e))?;
+
+    let session_guard = state.session_manager.lock().await;
+    if let Some(session) = session_guard.as_ref() {
+        if let Some(webrtc) = &session.webrtc {
+            // Envoyer FileTransferStart
+            let start_msg = ControlMessage::FileTransferStart {
+                id: id.clone(), name, size,
+            };
+            let bytes = start_msg.to_bytes().map_err(|e| format!("Erreur: {}", e))?;
+            webrtc.send_data(&bytes).await.map_err(|e| format!("Erreur envoi: {}", e))?;
+
+            // Envoyer les chunks
+            let mut offset = 0u64;
+            for chunk in chunks {
+                let chunk_len = chunk.len() as u64;
+                let chunk_msg = ControlMessage::FileTransferChunk {
+                    id: id.clone(), data: chunk, offset,
+                };
+                let bytes = chunk_msg.to_bytes().map_err(|e| format!("Erreur: {}", e))?;
+                webrtc.send_data(&bytes).await.map_err(|e| format!("Erreur envoi: {}", e))?;
+                offset += chunk_len;
+            }
+
+            // Envoyer FileTransferComplete
+            let complete_msg = ControlMessage::FileTransferComplete { id };
+            let bytes = complete_msg.to_bytes().map_err(|e| format!("Erreur: {}", e))?;
+            webrtc.send_data(&bytes).await.map_err(|e| format!("Erreur envoi: {}", e))?;
+
+            Ok(())
+        } else {
+            Err("Pas de connexion WebRTC".to_string())
+        }
+    } else {
+        Err("Non connecté".to_string())
+    }
 }
 
 fn main() {
@@ -1043,7 +1303,7 @@ fn main() {
     // Extraire le port du serveur pour la discovery
     let server_port: u16 = config.server_url
         .split(':')
-        .last()
+        .next_back()
         .and_then(|s| s.split('/').next())
         .and_then(|s| s.parse().ok())
         .unwrap_or(9000);
@@ -1063,6 +1323,9 @@ fn main() {
         pending_requests: Arc::new(Mutex::new(Vec::new())),
         streamer_handle: Arc::new(Mutex::new(None)),
         discovered_peers,
+        clipboard_manager: Arc::new(std::sync::Mutex::new(ClipboardManager::new())),
+        file_transfer_manager: Arc::new(Mutex::new(FileTransferManager::new())),
+        active_capturer: Arc::new(Mutex::new(None)),
     };
 
     // Cloner pour les closures
@@ -1093,6 +1356,17 @@ fn main() {
             reject_connection,
             get_pending_requests,
             start_listening_for_requests,
+            // Clipboard
+            sync_clipboard,
+            get_clipboard,
+            set_clipboard,
+            // Chat
+            send_chat_message,
+            // Multi-monitor
+            get_displays,
+            change_display,
+            // File transfer
+            send_file,
             // Storage commands
             get_connection_history,
             get_known_peers,
@@ -1115,6 +1389,49 @@ fn main() {
                 eprintln!("[TAURI] Impossible de définir le titre: {}", e);
             }
 
+            // Configurer le System Tray
+            let device_id_label = device_id_for_title.clone();
+            let open_item = MenuItemBuilder::with_id("open", "Ouvrir GhostHandDesk").build(app)?;
+            let device_item = MenuItemBuilder::with_id("device_id", format!("ID: {}", device_id_label))
+                .enabled(false)
+                .build(app)?;
+            let quit_item = MenuItemBuilder::with_id("quit", "Quitter").build(app)?;
+
+            let tray_menu = MenuBuilder::new(app)
+                .item(&open_item)
+                .separator()
+                .item(&device_item)
+                .separator()
+                .item(&quit_item)
+                .build()?;
+
+            let _tray = TrayIconBuilder::new()
+                .menu(&tray_menu)
+                .tooltip(format!("GhostHandDesk - {}", device_id_for_title))
+                .on_menu_event(move |app, event| {
+                    match event.id().as_ref() {
+                        "open" => {
+                            if let Some(w) = app.get_webview_window("main") {
+                                let _ = w.show();
+                                let _ = w.set_focus();
+                            }
+                        }
+                        "quit" => {
+                            std::process::exit(0);
+                        }
+                        _ => {}
+                    }
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let tauri::tray::TrayIconEvent::DoubleClick { .. } = event {
+                        if let Some(w) = tray.app_handle().get_webview_window("main") {
+                            let _ = w.show();
+                            let _ = w.set_focus();
+                        }
+                    }
+                })
+                .build(app)?;
+
             // Afficher le PID du serveur
             if let Ok(guard) = server_for_setup.lock() {
                 if let Some((ref child, _)) = *guard {
@@ -1127,9 +1444,18 @@ fn main() {
 
             Ok(())
         })
-        .on_window_event(|_window, event| {
-            if let tauri::WindowEvent::Destroyed = event {
-                println!("[APP] Fenêtre fermée, nettoyage en cours...");
+        .on_window_event(|window, event| {
+            match event {
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    // Minimiser dans le tray au lieu de fermer
+                    window.hide().unwrap_or_default();
+                    api.prevent_close();
+                    println!("[APP] Fenêtre minimisée dans le tray");
+                }
+                tauri::WindowEvent::Destroyed => {
+                    println!("[APP] Fenêtre détruite, nettoyage en cours...");
+                }
+                _ => {}
             }
         })
         .run(tauri::generate_context!())

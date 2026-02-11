@@ -182,7 +182,7 @@ impl Storage {
         let file = File::create(&self.storage_path)?;
         let writer = BufWriter::new(file);
         serde_json::to_writer_pretty(writer, &self.data).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("Erreur sérialisation JSON: {}", e))
+            io::Error::other(format!("Erreur sérialisation JSON: {}", e))
         })?;
 
         info!("Storage sauvegardé: {}", self.storage_path.display());

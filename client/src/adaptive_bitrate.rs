@@ -108,6 +108,12 @@ pub struct AdaptiveBitrateStats {
     pub average_packet_loss: f32,
 }
 
+impl Default for AdaptiveBitrateController {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AdaptiveBitrateController {
     /// Créer un nouveau contrôleur avec configuration par défaut
     pub fn new() -> Self {

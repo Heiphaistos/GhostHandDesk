@@ -1,6 +1,16 @@
 /// Protocol de messages échangés via le data channel WebRTC
 use serde::{Deserialize, Serialize};
 
+/// Info d'un écran distant (pour multi-monitor)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisplayInfoProto {
+    pub id: u32,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub is_primary: bool,
+}
+
 /// Modifiers clavier transmis avec les événements KeyPress
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct KeyModifiersProto {
@@ -51,6 +61,41 @@ pub enum ControlMessage {
         pressed: bool,
         #[serde(default)]
         modifiers: Option<KeyModifiersProto>,
+    },
+
+    // Clipboard sync
+    ClipboardSync {
+        content: String,
+    },
+
+    // File transfer
+    FileTransferStart {
+        id: String,
+        name: String,
+        size: u64,
+    },
+    FileTransferChunk {
+        id: String,
+        data: Vec<u8>,
+        offset: u64,
+    },
+    FileTransferComplete {
+        id: String,
+    },
+
+    // Chat
+    ChatMessage {
+        from: String,
+        text: String,
+        timestamp: u64,
+    },
+
+    // Display control
+    SelectDisplay {
+        display_id: u32,
+    },
+    DisplayListResponse {
+        displays: Vec<DisplayInfoProto>,
     },
 
     // System

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use tokio::time::{interval, Duration};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 // Diagnostic temporaire - écriture directe dans un fichier log
 fn stream_diag(msg: &str) {
@@ -78,6 +78,11 @@ impl Streamer {
         self
     }
 
+    /// Obtenir une référence partagée au capturer (pour switch de moniteur externe)
+    pub fn capturer(&self) -> Arc<Mutex<Box<dyn ScreenCapturer>>> {
+        self.capturer.clone()
+    }
+
     /// Démarrer le streaming
     pub async fn start(&self) -> Result<()> {
         info!("Démarrage du streaming vidéo à {} FPS", self.framerate);
@@ -89,23 +94,31 @@ impl Streamer {
         // Marquer comme running (AtomicBool = pas de lock)
         self.running.store(true, Ordering::SeqCst);
 
+        // PERF: Flag pour frame skipping - si l'envoi précédent n'est pas fini, skip
+        let sending = Arc::new(AtomicBool::new(false));
+
         // Créer un interval pour le framerate
         let frame_duration = Duration::from_millis(1000 / self.framerate as u64);
         let mut ticker = interval(frame_duration);
 
         let mut frame_count = 0u64;
         let mut error_count = 0u32;
+        let mut skip_count = 0u64;
 
         while self.running.load(Ordering::SeqCst) {
             ticker.tick().await;
 
+            // PERF: Skip frame si l'envoi précédent est encore en cours
+            if sending.load(Ordering::SeqCst) {
+                skip_count += 1;
+                continue;
+            }
+
             // 1. Capturer frame ASYNC (scope explicite pour libérer le lock immédiatement)
-            // PERF-001: Utilisation de capture_async() pour ne pas bloquer le runtime Tokio
             let frame = {
                 let mut capturer_guard = self.capturer.lock().await;
                 match capturer_guard.capture_async().await {
                     Ok(f) => {
-                        // Reset error count sur succès
                         error_count = 0;
                         f
                     },
@@ -121,7 +134,7 @@ impl Streamer {
                         continue;
                     }
                 }
-            }; // capturer_guard est drop ici
+            };
 
             // 2. Encoder frame (scope explicite pour libérer le lock immédiatement)
             let encoded = {
@@ -133,12 +146,11 @@ impl Streamer {
                         continue;
                     }
                 }
-            }; // encoder_guard est drop ici
+            };
 
             // 2.5 Envoyer au callback local (preview sur le PC contrôlé)
-            // Limité à ~10 FPS (1 frame sur 3 à 30 FPS) pour ne pas surcharger
             if let Some(ref cb) = self.local_frame_callback {
-                if frame_count % 3 == 0 {
+                if frame_count.is_multiple_of(3) {
                     cb(encoded.data.clone(), encoded.width, encoded.height, encoded.timestamp);
                 }
             }
@@ -149,27 +161,28 @@ impl Streamer {
                 width: encoded.width,
                 height: encoded.height,
                 timestamp: encoded.timestamp,
-                format: "jpeg".to_string(), // ou "h264" selon l'encoder
+                format: "jpeg".to_string(),
             };
 
-            // 4. Envoyer via WebRTC (scope explicite) + mesure RTT proxy
+            // 4. Envoyer via WebRTC avec frame skipping
             let send_start = std::time::Instant::now();
+            sending.store(true, Ordering::SeqCst);
             match message.to_bytes() {
                 Ok(bytes) => {
                     let webrtc_guard = self.webrtc.lock().await;
                     if let Err(e) = webrtc_guard.send_data(&bytes).await {
-                        if frame_count < 5 || frame_count % 100 == 0 {
+                        if frame_count < 5 || frame_count.is_multiple_of(100) {
                             stream_diag(&format!("STREAMER: send_data ERREUR frame #{}: {}", frame_count, e));
                         }
-                    } else if frame_count < 3 || frame_count % 100 == 0 {
-                        stream_diag(&format!("STREAMER: Frame #{} envoyée ({} bytes)", frame_count, bytes.len()));
+                    } else if frame_count < 3 || frame_count.is_multiple_of(100) {
+                        stream_diag(&format!("STREAMER: Frame #{} envoyée ({} bytes, skipped: {})", frame_count, bytes.len(), skip_count));
                     }
-                    // webrtc_guard est drop ici automatiquement
                 }
                 Err(e) => {
                     warn!("Erreur de sérialisation du message: {}", e);
                 }
             }
+            sending.store(false, Ordering::SeqCst);
 
             // 5. Adaptive bitrate : utiliser durée d'envoi comme proxy RTT
             if let Some(ref controller) = self.adaptive_controller {
@@ -177,24 +190,24 @@ impl Streamer {
                 let mut ctrl = controller.lock().await;
                 ctrl.update_rtt(send_duration);
 
-                // Appliquer la qualité recommandée à l'encodeur via le trait
                 let new_quality = ctrl.get_quality();
-                drop(ctrl); // Libérer le lock du controller
+                drop(ctrl);
                 let mut encoder_guard = self.encoder.lock().await;
                 encoder_guard.adjust_quality(new_quality);
             }
 
             frame_count += 1;
-            if frame_count % (self.framerate as u64 * 10) == 0 {
+            if frame_count.is_multiple_of(self.framerate as u64 * 10) {
                 debug!(
-                    "Streaming: {} frames envoyées ({} secondes)",
+                    "Streaming: {} frames envoyées, {} skipped ({} secondes)",
                     frame_count,
+                    skip_count,
                     frame_count / self.framerate as u64
                 );
             }
         }
 
-        info!("Streaming arrêté. Total frames: {}", frame_count);
+        info!("Streaming arrêté. Total frames: {}, skipped: {}", frame_count, skip_count);
         Ok(())
     }
 
@@ -223,22 +236,22 @@ impl Receiver {
         }
     }
 
-    /// Démarrer la réception avec un callback pour les frames
-    pub async fn start<F>(self: Arc<Self>, frame_callback: F) -> Result<()>
+    /// Démarrer la réception avec callbacks pour vidéo et messages de contrôle
+    pub async fn start_with_message_handler<F, M>(
+        self: Arc<Self>,
+        frame_callback: F,
+        message_callback: M,
+    ) -> Result<()>
     where
         F: Fn(Vec<u8>, u32, u32, u64) + Send + Sync + 'static,
+        M: Fn(ControlMessage) + Send + Sync + 'static,
     {
         info!("Démarrage de la réception vidéo");
 
-        // Créer un canal mpsc pour éviter les "lost wakeups"
-        // Le callback WebRTC envoie les données dans le canal,
-        // et une task async les traite séparément
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
         let webrtc = self.webrtc.lock().await;
 
-        // Setup callback pour recevoir les messages du data channel
-        // Le callback envoie juste les données brutes dans le canal
         let rx_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let rx_counter_clone = rx_counter.clone();
         webrtc.on_data_channel_message(move |data: &[u8]| {
@@ -251,37 +264,33 @@ impl Receiver {
 
         stream_diag("Receiver: on_data_channel_message configuré OK");
 
-        // Spawner une task pour traiter les messages du canal
-        // Avec réassemblage des chunks pour les gros messages (vidéo)
-        let callback = Arc::new(frame_callback);
+        let frame_cb = Arc::new(frame_callback);
+        let msg_cb = Arc::new(message_callback);
         tokio::spawn(async move {
-            let mut reassembly: Option<(usize, Vec<u8>)> = None; // (expected_len, buffer)
+            let mut reassembly: Option<(usize, Vec<u8>)> = None;
 
             while let Some(data) = rx.recv().await {
                 // Vérifier si c'est un message fragmenté
                 if data.len() >= 2 && data[0] == 0xFF {
                     match data[1] {
                         0x01 if data.len() >= 6 => {
-                            // Header de fragment: [0xFF][0x01][total_len: u32 LE]
                             let total_len = u32::from_le_bytes([data[2], data[3], data[4], data[5]]) as usize;
                             reassembly = Some((total_len, Vec::with_capacity(total_len)));
                             continue;
                         }
                         0x02 => {
-                            // Chunk de données: [0xFF][0x02][data...]
                             if let Some((expected_len, ref mut buffer)) = reassembly {
                                 buffer.extend_from_slice(&data[2..]);
                                 if buffer.len() >= expected_len {
-                                    // Réassemblage terminé — traiter le message complet
                                     let complete_data = std::mem::take(buffer);
                                     reassembly = None;
                                     if let Ok(msg) = ControlMessage::from_bytes(&complete_data) {
                                         match msg {
                                             ControlMessage::VideoFrame { data, width, height, timestamp, .. } => {
-                                                callback(data, width, height, timestamp);
+                                                frame_cb(data, width, height, timestamp);
                                             }
-                                            _ => {
-                                                debug!("Message non-vidéo (reassemblé): {:?}", msg);
+                                            other => {
+                                                msg_cb(other);
                                             }
                                         }
                                     }
@@ -289,7 +298,7 @@ impl Receiver {
                             }
                             continue;
                         }
-                        _ => {} // Pas un header de chunk, traiter normalement
+                        _ => {}
                     }
                 }
 
@@ -297,10 +306,10 @@ impl Receiver {
                 if let Ok(msg) = ControlMessage::from_bytes(&data) {
                     match msg {
                         ControlMessage::VideoFrame { data, width, height, timestamp, .. } => {
-                            callback(data, width, height, timestamp);
+                            frame_cb(data, width, height, timestamp);
                         }
-                        _ => {
-                            debug!("Message non-vidéo reçu: {:?}", msg);
+                        other => {
+                            msg_cb(other);
                         }
                     }
                 }

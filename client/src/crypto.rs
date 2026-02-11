@@ -13,6 +13,12 @@ pub struct CryptoManager {
     rng: SystemRandom,
 }
 
+impl Default for CryptoManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CryptoManager {
     pub fn new() -> Self {
         Self {
@@ -256,6 +262,12 @@ impl NonceSequence for SingleNonce {
 /// Key exchange using X25519 ECDH (Elliptic Curve Diffie-Hellman)
 pub struct KeyExchange {
     rng: SystemRandom,
+}
+
+impl Default for KeyExchange {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl KeyExchange {
