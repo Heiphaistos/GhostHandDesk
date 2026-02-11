@@ -158,6 +158,11 @@ interface DisplayInfo {
 const displays = ref<DisplayInfo[]>([]);
 const selectedDisplay = ref(0);
 
+// Résolution réelle de l'écran distant (AVANT downscale encoder)
+// Utilisée pour le mapping des coordonnées souris
+const sourceWidth = ref(0);
+const sourceHeight = ref(0);
+
 // Dimensions de l'écran distant et zone de dessin réelle dans le canvas
 const remoteWidth = ref(0);
 const remoteHeight = ref(0);
@@ -173,6 +178,7 @@ let clipboardEventHandler: ((event: Event) => void) | null = null;
 let displayListHandler: ((event: Event) => void) | null = null;
 let resizeObserver: ResizeObserver | null = null;
 let lastMouseMoveTime = 0; // Throttle MouseMove à 60Hz
+let lastFrameTime = 0; // Pour mesure latence inter-frame
 let totalBytesReceived = 0;
 let frameSizes: number[] = [];
 
@@ -225,6 +231,7 @@ onMounted(async () => {
     const list = (event as CustomEvent).detail;
     if (Array.isArray(list)) {
       displays.value = list;
+      updateSourceResolution();
       console.log('[VIEWER] Display list reçue:', list.length, 'écrans');
     }
   });
@@ -379,8 +386,15 @@ function handleVideoFrame(payload: VideoFramePayload) {
       totalBytesReceived += payload.data.length;
       frameSizes.push(payload.data.length);
 
+      // Mesure de latence inter-frame (temps entre 2 frames consécutives)
+      // Note: on ne peut pas comparer les timestamps de 2 PCs (clock desync)
       const now = Date.now();
-      latency.value = Math.max(0, now - payload.timestamp);
+      if (lastFrameTime > 0) {
+        const interFrame = now - lastFrameTime;
+        // Lisser la latence affichée (moyenne mobile)
+        latency.value = Math.round(latency.value * 0.7 + interFrame * 0.3);
+      }
+      lastFrameTime = now;
     }).catch((err) => {
       console.error('[SÉCURITÉ] Erreur décodage image:', err);
     });
@@ -436,10 +450,12 @@ function canvasToRemote(event: MouseEvent): { x: number; y: number } | null {
   const clampedX = Math.max(0, Math.min(1, relX));
   const clampedY = Math.max(0, Math.min(1, relY));
 
-  // Convertir en coordonnées de l'écran distant
+  // Convertir en coordonnées de l'écran distant RÉEL (pas le frame downscalé)
+  const mapWidth = sourceWidth.value || remoteWidth.value;
+  const mapHeight = sourceHeight.value || remoteHeight.value;
   return {
-    x: Math.round(clampedX * remoteWidth.value),
-    y: Math.round(clampedY * remoteHeight.value),
+    x: Math.round(clampedX * mapWidth),
+    y: Math.round(clampedY * mapHeight),
   };
 }
 
@@ -635,9 +651,22 @@ async function handleSyncClipboard() {
 async function changeDisplay() {
   try {
     await invoke('change_display', { displayId: selectedDisplay.value });
+    updateSourceResolution();
     console.log('[VIEWER] SelectDisplay envoyé:', selectedDisplay.value);
   } catch (error) {
     console.error('Erreur changement écran:', error);
+  }
+}
+
+// Mettre à jour la résolution source depuis la display info du moniteur sélectionné
+function updateSourceResolution() {
+  const d = displays.value.find(d => d.id === selectedDisplay.value)
+    || displays.value.find(d => d.is_primary)
+    || displays.value[0];
+  if (d) {
+    sourceWidth.value = d.width;
+    sourceHeight.value = d.height;
+    console.log('[VIEWER] Source resolution:', sourceWidth.value, 'x', sourceHeight.value);
   }
 }
 </script>

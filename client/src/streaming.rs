@@ -10,7 +10,7 @@ use crate::protocol::ControlMessage;
 use crate::screen_capture::ScreenCapturer;
 use crate::video_encoder::VideoEncoder;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::Mutex;
 use tokio::time::{interval, Duration};
 use tracing::{debug, info, warn};
@@ -86,18 +86,31 @@ impl Streamer {
     /// Démarrer le streaming
     pub async fn start(&self) -> Result<()> {
         info!("Démarrage du streaming vidéo à {} FPS", self.framerate);
-
-        // Note: E2E encryption dans le pipeline vidéo n'est pas encore intégré
-        // L'encryption E2E est gérée au niveau WebRTC (DTLS-SRTP) pour le moment
         warn!("E2E encryption au niveau applicatif non intégré dans le pipeline vidéo - DTLS-SRTP actif par défaut");
 
-        // Marquer comme running (AtomicBool = pas de lock)
         self.running.store(true, Ordering::SeqCst);
 
-        // PERF: Flag pour frame skipping - si l'envoi précédent n'est pas fini, skip
-        let sending = Arc::new(AtomicBool::new(false));
+        // Channel pour découpler capture/encode de l'envoi réseau (capacity 2)
+        // Si le sender est lent, try_send échoue → frame skippée (pas de backpressure)
+        let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
 
-        // Créer un interval pour le framerate
+        // Durée du dernier envoi partagée via AtomicU64 (pour adaptive bitrate)
+        let last_send_ns = Arc::new(AtomicU64::new(0));
+        let last_send_ns_clone = last_send_ns.clone();
+
+        // Task d'envoi séparée — tourne indépendamment de la boucle de capture
+        let webrtc = self.webrtc.clone();
+        tokio::spawn(async move {
+            while let Some(bytes) = frame_rx.recv().await {
+                let start = std::time::Instant::now();
+                let webrtc_guard = webrtc.lock().await;
+                if let Err(e) = webrtc_guard.send_data(&bytes).await {
+                    stream_diag(&format!("SENDER: erreur envoi: {}", e));
+                }
+                last_send_ns_clone.store(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+        });
+
         let frame_duration = Duration::from_millis(1000 / self.framerate as u64);
         let mut ticker = interval(frame_duration);
 
@@ -108,13 +121,7 @@ impl Streamer {
         while self.running.load(Ordering::SeqCst) {
             ticker.tick().await;
 
-            // PERF: Skip frame si l'envoi précédent est encore en cours
-            if sending.load(Ordering::SeqCst) {
-                skip_count += 1;
-                continue;
-            }
-
-            // 1. Capturer frame ASYNC (scope explicite pour libérer le lock immédiatement)
+            // 1. Capturer frame
             let frame = {
                 let mut capturer_guard = self.capturer.lock().await;
                 match capturer_guard.capture_async().await {
@@ -122,11 +129,10 @@ impl Streamer {
                         error_count = 0;
                         f
                     },
-                    Err(e) => {
+                    Err(_e) => {
                         error_count += 1;
-                        stream_diag(&format!("STREAMER: Erreur capture #{}: {}", error_count, e));
                         if error_count >= 5 {
-                            stream_diag("STREAMER: Trop d'erreurs, arrêt!");
+                            stream_diag("STREAMER: Trop d'erreurs capture, arrêt!");
                             return Err(GhostHandError::ScreenCapture(format!(
                                 "Échec après {} erreurs consécutives de capture", error_count
                             )));
@@ -136,7 +142,7 @@ impl Streamer {
                 }
             };
 
-            // 2. Encoder frame (scope explicite pour libérer le lock immédiatement)
+            // 2. Encoder frame
             let encoded = {
                 let mut encoder_guard = self.encoder.lock().await;
                 match encoder_guard.encode(&frame).await {
@@ -148,14 +154,14 @@ impl Streamer {
                 }
             };
 
-            // 2.5 Envoyer au callback local (preview sur le PC contrôlé)
+            // 2.5 Preview locale (1 frame sur 3 = ~10 FPS)
             if let Some(ref cb) = self.local_frame_callback {
                 if frame_count.is_multiple_of(3) {
                     cb(encoded.data.clone(), encoded.width, encoded.height, encoded.timestamp);
                 }
             }
 
-            // 3. Créer le message ControlMessage
+            // 3. Sérialiser
             let message = ControlMessage::VideoFrame {
                 data: encoded.data,
                 width: encoded.width,
@@ -164,45 +170,39 @@ impl Streamer {
                 format: "jpeg".to_string(),
             };
 
-            // 4. Envoyer via WebRTC avec frame skipping
-            let send_start = std::time::Instant::now();
-            sending.store(true, Ordering::SeqCst);
+            // 4. Envoyer via channel (skip si le sender est occupé)
             match message.to_bytes() {
                 Ok(bytes) => {
-                    let webrtc_guard = self.webrtc.lock().await;
-                    if let Err(e) = webrtc_guard.send_data(&bytes).await {
-                        if frame_count < 5 || frame_count.is_multiple_of(100) {
-                            stream_diag(&format!("STREAMER: send_data ERREUR frame #{}: {}", frame_count, e));
+                    match frame_tx.try_send(bytes) {
+                        Ok(_) => {},
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            skip_count += 1;
                         }
-                    } else if frame_count < 3 || frame_count.is_multiple_of(100) {
-                        stream_diag(&format!("STREAMER: Frame #{} envoyée ({} bytes, skipped: {})", frame_count, bytes.len(), skip_count));
+                        Err(_) => break, // Channel fermé
                     }
                 }
-                Err(e) => {
-                    warn!("Erreur de sérialisation du message: {}", e);
-                }
+                Err(e) => warn!("Erreur sérialisation: {}", e),
             }
-            sending.store(false, Ordering::SeqCst);
 
-            // 5. Adaptive bitrate : utiliser durée d'envoi comme proxy RTT
+            // 5. Adaptive bitrate basé sur la durée d'envoi du sender task
             if let Some(ref controller) = self.adaptive_controller {
-                let send_duration = send_start.elapsed();
-                let mut ctrl = controller.lock().await;
-                ctrl.update_rtt(send_duration);
-
-                let new_quality = ctrl.get_quality();
-                drop(ctrl);
-                let mut encoder_guard = self.encoder.lock().await;
-                encoder_guard.adjust_quality(new_quality);
+                let send_ns = last_send_ns.load(Ordering::Relaxed);
+                if send_ns > 0 {
+                    let send_duration = Duration::from_nanos(send_ns);
+                    let mut ctrl = controller.lock().await;
+                    ctrl.update_rtt(send_duration);
+                    let new_quality = ctrl.get_quality();
+                    drop(ctrl);
+                    let mut encoder_guard = self.encoder.lock().await;
+                    encoder_guard.adjust_quality(new_quality);
+                }
             }
 
             frame_count += 1;
             if frame_count.is_multiple_of(self.framerate as u64 * 10) {
                 debug!(
-                    "Streaming: {} frames envoyées, {} skipped ({} secondes)",
-                    frame_count,
-                    skip_count,
-                    frame_count / self.framerate as u64
+                    "Streaming: {} frames envoyées, {} skipped ({} sec)",
+                    frame_count, skip_count, frame_count / self.framerate as u64
                 );
             }
         }

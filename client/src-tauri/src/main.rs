@@ -874,8 +874,19 @@ async fn start_input_handler(
 
     if let Some(session) = session_guard.as_ref() {
         if let Some(webrtc) = &session.webrtc {
-            let handler = Arc::new(InputHandler::new()
+            // Utiliser la vraie résolution de l'écran pour le clamping des coordonnées
+            let (res_w, res_h) = {
+                let cap_opt = state.active_capturer.lock().await;
+                if let Some(ref cap) = *cap_opt {
+                    let cap_guard = cap.lock().await;
+                    cap_guard.get_resolution()
+                } else {
+                    (1920, 1080)
+                }
+            };
+            let handler = Arc::new(InputHandler::new_with_resolution(res_w as i32, res_h as i32)
                 .map_err(|e| format!("Erreur création handler: {}", e))?);
+            println!("[TAURI] InputHandler créé avec résolution {}x{}", res_w, res_h);
 
             // Setup manuel du data channel callback (au lieu de attach_to_webrtc)
             // pour pouvoir aussi gérer SelectDisplay
