@@ -11,18 +11,29 @@ Cargo.lock
 *.so
 *.dylib
 
-# Logs
+# Logs & diagnostics (peuvent contenir des Device IDs, timestamps, IPs)
 logs/
 *.log
 *.jsonl
+diag.log
+instance*.log
+build-output.log
 
-# Data
+# Data & storage (contiennent l'historique de connexions, peers connus)
 data/
 *.db
 *.sqlite
+storage.json
+storage.backup.json
 
-# Certs
-certs/*.pem
+# Certificats & clés privées
+certs/
+*.pem
+*.key
+*.crt
+
+# Ports & adresses réseau
+server_port.txt
 
 # IDEs
 .vscode/
@@ -44,22 +55,24 @@ dist/
 client/src-tauri/target/
 client/ui/dist/
 
-# Portable package
+# Portable package (runtime data)
 GhostHandDesk-Portable/logs/
 GhostHandDesk-Portable/data/
+GhostHandDesk-Portable/certs/
 GhostHandDesk-Portable/Instance1/
 GhostHandDesk-Portable/Instance2/
 GhostHandDesk-Portable/_start_server.bat
 GhostHandDesk-Portable/*.exe
+GhostHandDesk-Portable/server_port.txt
 
 # Build output
-build-output.log
 server/signaling-server.exe
 
 # Windows artifacts
 nul
 
-# Temp
+# Temp & scripts jetables
 *.tmp
 *.temp
 _start_server.bat
+_get_titles.ps1
