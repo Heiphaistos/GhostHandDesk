@@ -1,6 +1,6 @@
 # GhostHandDesk
 
-[![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](https://github.com/heiphaistos44-crypto/GhostHandDesk)
+[![Version](https://img.shields.io/badge/version-0.2.0-blue.svg)](https://github.com/heiphaistos44-crypto/GhostHandDesk)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org/)
 [![Go](https://img.shields.io/badge/go-1.20+-00ADD8.svg)](https://golang.org/)
@@ -91,9 +91,13 @@ GhostHandDesk/
 ### Securite
 - **CSP** : Content Security Policy stricte dans la webview Tauri
 - **Chiffrement E2E** : X25519 ECDH + AES-256-GCM (module crypto)
+- **PBKDF2-SHA256** : 100 000 iterations pour les mots de passe de connexion
+- **Device ID persistant** : 128 bits cryptographiquement aleatoires (fichier `data/device.id`)
 - **Authentification par mot de passe** : challenge/response avec hachage
 - **Validation des entrees** : Device ID, SDP, ICE candidates, frames video
 - **Rate limiting** : 100 messages/minute par client cote serveur
+- **TLS auto-detecte** : detection automatique via `CERT_FILE` + `KEY_FILE`
+- **4 serveurs STUN** : Google x2, Cloudflare, Mozilla (fallback automatique)
 - **Audit trail** : logs structures JSON avec niveaux de severite
 - **Sanitisation UTF-8** : troncature safe aux frontieres de caracteres
 
@@ -164,6 +168,19 @@ cd ../server && go test ./internal/signaling/... -v
 ## License
 
 MIT License
+
+---
+
+## Utilisation sans VPS (P2P auto-heberge)
+
+1. **PC A** (hote) : extraire le ZIP, ouvrir port 9000 TCP, lancer `LANCER-GHOSTHANDDESK.bat`
+2. **PC B** : meme ZIP, dans Parametres → URL : `ws://<IP_PC_A>:9000/ws`
+3. Entrer le Device ID du PC A → Connecter
+
+## Avec VPS public
+
+Lancer le serveur avec `DISABLE_ORIGIN_CHECK=true`.
+Configurer l'URL : `wss://votre-vps.example.com/ws`
 
 ---
 

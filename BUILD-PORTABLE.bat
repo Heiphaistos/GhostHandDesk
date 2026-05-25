@@ -102,7 +102,7 @@ echo   Supprimez simplement ce dossier.
 echo   Aucune trace ne restera sur votre PC.
 echo.
 echo ========================================
-echo Version : 0.1.0 Portable
+echo Version : 0.2.0 Portable
 echo Date : %DATE%
 echo ========================================
 ) > "%PORTABLE_DIR%\README.txt"
