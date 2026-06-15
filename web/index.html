@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GhostHandDesk — Bureau à distance sécurisé</title>
+  <meta name="description" content="Application de bureau à distance WebRTC avec chiffrement E2E X25519 + AES-256-GCM. Gratuit, open source, sans abonnement.">
+  <meta property="og:title" content="GhostHandDesk — Bureau à distance sécurisé">
+  <meta property="og:description" content="Contrôle à distance WebRTC chiffré E2E. Zéro abonnement, open source.">
+  <meta property="og:image" content="https://ghd.heiphaistos.org/og-image.png">
+  <meta property="og:url" content="https://ghd.heiphaistos.org">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="canonical" href="https://ghd.heiphaistos.org">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0a0c10;
+      --bg2: #0f1117;
+      --bg3: #161b25;
+      --border: #1e2533;
+      --accent: #4f8ef7;
+      --accent2: #7c3aed;
+      --text: #e2e8f0;
+      --text2: #8b98b0;
+      --green: #10b981;
+      --radius: 12px;
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      line-height: 1.6;
+      min-height: 100vh;
+    }
+
+    /* NAV */
+    nav {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      background: rgba(10, 12, 16, 0.85);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+      padding: 0 2rem;
+      height: 56px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .nav-logo {
+      font-size: 1rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      text-decoration: none;
+      color: var(--text);
+    }
+    .nav-logo .ghost { font-size: 1.2rem; }
+    .nav-links { display: flex; gap: 1.5rem; align-items: center; }
+    .nav-links a {
+      color: var(--text2);
+      text-decoration: none;
+      font-size: 0.875rem;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--text); }
+    .nav-gh {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      background: var(--bg3);
+      border: 1px solid var(--border);
+      color: var(--text) !important;
+      padding: 0.35rem 0.75rem;
+      border-radius: 6px;
+      font-size: 0.8rem;
+      font-weight: 500;
+    }
+
+    /* HERO */
+    .hero {
+      padding: 6rem 2rem 4rem;
+      text-align: center;
+      max-width: 800px;
+      margin: 0 auto;
+    }
+    .hero-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      background: rgba(79, 142, 247, 0.1);
+      border: 1px solid rgba(79, 142, 247, 0.25);
+      color: var(--accent);
+      font-size: 0.8rem;
+      font-weight: 500;
+      padding: 0.3rem 0.75rem;
+      border-radius: 99px;
+      margin-bottom: 1.5rem;
+    }
+    .hero h1 {
+      font-size: clamp(2rem, 5vw, 3.2rem);
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      line-height: 1.15;
+      margin-bottom: 1.25rem;
+      background: linear-gradient(135deg, #e2e8f0 30%, #8b98b0);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .hero p {
+      font-size: 1.1rem;
+      color: var(--text2);
+      max-width: 600px;
+      margin: 0 auto 2.5rem;
+    }
+    .hero-buttons {
+      display: flex;
+      gap: 0.75rem;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.75rem 1.5rem;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      text-decoration: none;
+      cursor: pointer;
+      transition: all 0.2s;
+      border: none;
+    }
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+      box-shadow: 0 0 20px rgba(79, 142, 247, 0.3);
+    }
+    .btn-primary:hover {
+      background: #3d7de8;
+      box-shadow: 0 0 28px rgba(79, 142, 247, 0.45);
+      transform: translateY(-1px);
+    }
+    .btn-secondary {
+      background: var(--bg3);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .btn-secondary:hover {
+      background: var(--border);
+      transform: translateY(-1px);
+    }
+    .btn-ghost {
+      background: transparent;
+      color: var(--text2);
+      border: 1px solid var(--border);
+      font-size: 0.8rem;
+    }
+    .btn-ghost:hover { color: var(--text); background: var(--bg3); }
+
+    /* DOWNLOAD CARDS */
+    .downloads {
+      padding: 3rem 2rem;
+      max-width: 900px;
+      margin: 0 auto;
+    }
+    .section-label {
+      text-align: center;
+      font-size: 0.75rem;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--text2);
+      margin-bottom: 1.5rem;
+    }
+    .download-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 1rem;
+    }
+    .download-card {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+      transition: border-color 0.2s, transform 0.2s;
+    }
+    .download-card:hover {
+      border-color: var(--accent);
+      transform: translateY(-2px);
+    }
+    .card-icon { font-size: 2rem; }
+    .card-title { font-weight: 700; font-size: 1rem; }
+    .card-sub { font-size: 0.8rem; color: var(--text2); }
+    .card-size {
+      font-size: 0.75rem;
+      color: var(--text2);
+      margin-top: auto;
+      padding-top: 0.5rem;
+      border-top: 1px solid var(--border);
+    }
+
+    /* FEATURES */
+    .features {
+      padding: 4rem 2rem;
+      max-width: 1000px;
+      margin: 0 auto;
+    }
+    .features h2 {
+      text-align: center;
+      font-size: 1.8rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 2.5rem;
+    }
+    .feat-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1px;
+      background: var(--border);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    .feat-item {
+      background: var(--bg2);
+      padding: 1.75rem;
+    }
+    .feat-icon {
+      font-size: 1.5rem;
+      margin-bottom: 0.75rem;
+    }
+    .feat-item h3 { font-size: 0.95rem; font-weight: 700; margin-bottom: 0.4rem; }
+    .feat-item p { font-size: 0.85rem; color: var(--text2); line-height: 1.5; }
+    .badge-e2e {
+      display: inline-block;
+      background: rgba(16, 185, 129, 0.12);
+      color: var(--green);
+      font-size: 0.7rem;
+      font-weight: 700;
+      padding: 0.15rem 0.5rem;
+      border-radius: 4px;
+      border: 1px solid rgba(16, 185, 129, 0.25);
+    }
+
+    /* HOW IT WORKS */
+    .how {
+      padding: 4rem 2rem;
+      max-width: 700px;
+      margin: 0 auto;
+      text-align: center;
+    }
+    .how h2 { font-size: 1.8rem; font-weight: 700; letter-spacing: -0.02em; margin-bottom: 2rem; }
+    .steps { display: flex; flex-direction: column; gap: 1rem; text-align: left; }
+    .step {
+      display: flex;
+      gap: 1rem;
+      align-items: flex-start;
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.25rem;
+    }
+    .step-num {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.8rem;
+      font-weight: 800;
+      flex-shrink: 0;
+      color: #fff;
+    }
+    .step-body h4 { font-size: 0.9rem; font-weight: 700; margin-bottom: 0.25rem; }
+    .step-body p { font-size: 0.82rem; color: var(--text2); }
+
+    /* TECH STACK */
+    .tech {
+      padding: 3rem 2rem;
+      max-width: 700px;
+      margin: 0 auto;
+      text-align: center;
+    }
+    .tech-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      justify-content: center;
+      margin-top: 1.5rem;
+    }
+    .chip {
+      background: var(--bg3);
+      border: 1px solid var(--border);
+      color: var(--text2);
+      font-size: 0.78rem;
+      font-weight: 500;
+      padding: 0.3rem 0.75rem;
+      border-radius: 99px;
+    }
+
+    /* FOOTER */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 2rem;
+      text-align: center;
+      color: var(--text2);
+      font-size: 0.8rem;
+    }
+    footer a { color: var(--text2); text-decoration: none; }
+    footer a:hover { color: var(--text); }
+
+    /* DIVIDER */
+    .divider {
+      height: 1px;
+      background: var(--border);
+      max-width: 1000px;
+      margin: 0 auto;
+    }
+
+    @media (max-width: 600px) {
+      .hero { padding: 4rem 1.5rem 3rem; }
+      .nav-links a:not(.nav-gh) { display: none; }
+    }
+  </style>
+</head>
+<body>
+
+<nav>
+  <a href="/" class="nav-logo">
+    <span class="ghost">👻</span>
+    GhostHandDesk
+  </a>
+  <div class="nav-links">
+    <a href="#features">Fonctionnalités</a>
+    <a href="#download">Télécharger</a>
+    <a href="https://github.com/heiphaistos44-crypto/GhostHandDesk" class="nav-gh" target="_blank" rel="noopener noreferrer">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"/></svg>
+      GitHub
+    </a>
+  </div>
+</nav>
+
+<!-- HERO -->
+<section class="hero">
+  <div class="hero-badge">
+    <span>🔐</span>
+    Chiffrement E2E · X25519 + AES-256-GCM
+  </div>
+  <h1>Bureau à distance<br>sans compromis</h1>
+  <p>Contrôle à distance WebRTC open source. Vos données ne transitent jamais en clair — chiffrement de bout en bout intégral, zéro abonnement.</p>
+  <div class="hero-buttons">
+    <a href="#download" class="btn btn-primary">
+      ↓ Télécharger v0.2.0
+    </a>
+    <a href="https://github.com/heiphaistos44-crypto/GhostHandDesk" class="btn btn-secondary" target="_blank" rel="noopener noreferrer">
+      Voir le code source
+    </a>
+  </div>
+</section>
+
+<!-- DOWNLOAD -->
+<section class="downloads" id="download">
+  <p class="section-label">Windows 10/11 · 64-bit</p>
+  <div class="download-grid">
+    <div class="download-card">
+      <div class="card-icon">⚙️</div>
+      <div class="card-title">Installeur NSIS</div>
+      <div class="card-sub">Installation classique avec raccourci bureau.</div>
+      <a href="https://github.com/heiphaistos44-crypto/GhostHandDesk/releases/download/v0.2.0/GhostHandDesk_0.2.0_x64-setup.exe" class="btn btn-primary">
+        Télécharger .exe
+      </a>
+      <div class="card-size">v0.2.0 · Recommandé</div>
+    </div>
+
+    <div class="download-card">
+      <div class="card-icon">📦</div>
+      <div class="card-title">Version Portable</div>
+      <div class="card-sub">Aucune installation — extrait et lance directement.</div>
+      <a href="https://github.com/heiphaistos44-crypto/GhostHandDesk/releases/download/v0.2.0/GhostHandDesk_v0.2.0_portable_x64.zip" class="btn btn-secondary">
+        Télécharger .zip
+      </a>
+      <div class="card-size">v0.2.0 · 9.7 MB</div>
+    </div>
+
+    <div class="download-card">
+      <div class="card-icon">🪟</div>
+      <div class="card-title">Package MSI</div>
+      <div class="card-sub">Pour déploiement GPO ou entreprise.</div>
+      <a href="https://github.com/heiphaistos44-crypto/GhostHandDesk/releases/download/v0.2.0/GhostHandDesk_0.2.0_x64_en-US.msi" class="btn btn-ghost">
+        Télécharger .msi
+      </a>
+      <div class="card-size">v0.2.0 · Windows Installer</div>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- FEATURES -->
+<section class="features" id="features">
+  <h2>Conçu pour la sécurité</h2>
+  <div class="feat-grid">
+    <div class="feat-item">
+      <div class="feat-icon">🔐</div>
+      <h3>Chiffrement E2E <span class="badge-e2e">E2E</span></h3>
+      <p>X25519 ECDH pour l'échange de clés + AES-256-GCM pour le flux vidéo. Aucune donnée en clair ne quitte votre machine.</p>
+    </div>
+    <div class="feat-item">
+      <div class="feat-icon">🌐</div>
+      <h3>WebRTC P2P</h3>
+      <p>Connexion directe entre machines via WebRTC. Le serveur de signaling ne voit que les métadonnées de connexion.</p>
+    </div>
+    <div class="feat-item">
+      <div class="feat-icon">🔑</div>
+      <h3>Authentification</h3>
+      <p>Mot de passe dérivé par PBKDF2-SHA256 (100k itérations). Device ID 128-bit cryptographique.</p>
+    </div>
+    <div class="feat-item">
+      <div class="feat-icon">📋</div>
+      <h3>Presse-papiers & Fichiers</h3>
+      <p>Synchronisation du presse-papiers et transfert de fichiers entre les machines chiffrés de bout en bout.</p>
+    </div>
+    <div class="feat-item">
+      <div class="feat-icon">💬</div>
+      <h3>Chat intégré</h3>
+      <p>Messagerie en cours de session sans quitter l'interface. Tout chiffré.</p>
+    </div>
+    <div class="feat-item">
+      <div class="feat-icon">🆓</div>
+      <h3>Open Source · Gratuit</h3>
+      <p>Code source disponible sur GitHub. Aucun abonnement, aucune télémétrie, aucun compte requis.</p>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- HOW IT WORKS -->
+<section class="how" id="how">
+  <h2>Comment ça marche</h2>
+  <div class="steps">
+    <div class="step">
+      <div class="step-num">1</div>
+      <div class="step-body">
+        <h4>L'hôte lance GhostHandDesk</h4>
+        <p>Un Device ID unique est généré. L'hôte partage son ID et un mot de passe au visiteur.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">2</div>
+      <div class="step-body">
+        <h4>Le visiteur se connecte</h4>
+        <p>Il entre l'ID et le mot de passe. La négociation WebRTC s'effectue via le serveur de signaling <code>ghd.heiphaistos.org</code>.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">3</div>
+      <div class="step-body">
+        <h4>Connexion directe chiffrée</h4>
+        <p>Une fois le tunnel WebRTC établi, le serveur est hors-jeu. Le flux vidéo et audio est direct, chiffré E2E.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">4</div>
+      <div class="step-body">
+        <h4>Contrôle total</h4>
+        <p>Souris, clavier, presse-papiers, fichiers — tout fonctionne comme si vous étiez physiquement devant la machine.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- STACK -->
+<section class="tech">
+  <p class="section-label">Stack technique</p>
+  <div class="tech-chips">
+    <span class="chip">Tauri v2</span>
+    <span class="chip">Rust</span>
+    <span class="chip">Vue 3</span>
+    <span class="chip">TypeScript</span>
+    <span class="chip">Go (signaling server)</span>
+    <span class="chip">WebRTC</span>
+    <span class="chip">X25519 ECDH</span>
+    <span class="chip">AES-256-GCM</span>
+    <span class="chip">WebSocket</span>
+    <span class="chip">PBKDF2-SHA256</span>
+  </div>
+</section>
+
+<!-- FOOTER -->
+<footer>
+  <p>
+    GhostHandDesk v0.2.0 · Open Source ·
+    <a href="https://github.com/heiphaistos44-crypto/GhostHandDesk" target="_blank" rel="noopener noreferrer">GitHub</a>
+    · <a href="https://heiphaistos.org" target="_blank" rel="noopener noreferrer">Heiphaistos</a>
+  </p>
+</footer>
+
+</body>
+</html>
