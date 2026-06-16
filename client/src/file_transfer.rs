@@ -83,7 +83,12 @@ impl FileTransferManager {
             GhostHandError::Internal(format!("Transfert {} non trouvé", id))
         })?;
 
-        let file_path = self.download_dir.join(&state.name);
+        // Extraire uniquement le nom de base pour prévenir le path traversal
+        let safe_name = std::path::Path::new(&state.name)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("received_file");
+        let file_path = self.download_dir.join(safe_name);
         std::fs::write(&file_path, &state.data).map_err(|e| {
             GhostHandError::Internal(format!("Erreur écriture fichier: {}", e))
         })?;

@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod settings_commands;
 mod storage_commands;
 
 use serde::{Deserialize, Serialize};
@@ -8,9 +9,11 @@ use tauri::{Manager, State, AppHandle};
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tokio::sync::Mutex;
+use ghost_hand_client::adaptive_bitrate::AdaptiveBitrateController;
 use ghost_hand_client::audit::{audit_log, init_global_logger, AuditEvent, AuditLevel};
 use ghost_hand_client::clipboard::ClipboardManager;
 use ghost_hand_client::config::{Config, VideoCodec};
+use ghost_hand_client::crypto::KeyExchange;
 use ghost_hand_client::file_transfer::FileTransferManager;
 use ghost_hand_client::network::{generate_device_id, SessionManager};
 use ghost_hand_client::protocol::{ControlMessage, DisplayInfoProto};
@@ -28,9 +31,13 @@ fn diag_log(msg: &str) {
         .as_millis();
     let line = format!("[{}] {}\n", timestamp, msg);
     eprintln!("{}", line.trim());
+    let log_path = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.join("diag.log")))
+        .unwrap_or_else(|| std::path::PathBuf::from("diag.log"));
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true).append(true)
-        .open("C:\\Users\\Momo\\Documents\\GhostHandDesk\\diag.log")
+        .open(&log_path)
     {
         let _ = f.write_all(line.as_bytes());
     }
@@ -126,13 +133,12 @@ fn start_embedded_server() -> Option<(std::process::Child, std::path::PathBuf)> 
         println!("[SERVER] Tentative de lancement sur le port {}...", port);
         match std::process::Command::new(&server_path)
             .env("REQUIRE_TLS", "false")
-            .env("DISABLE_ORIGIN_CHECK", "true")
             .env("SERVER_HOST", format!(":{}", port))
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
         {
-            Ok(child) => {
+            Ok(mut child) => {
                 println!("[SERVER] Serveur démarré (PID: {}) sur port {}", child.id(), port);
                 // Attendre que le serveur soit prêt
                 std::thread::sleep(std::time::Duration::from_millis(500));
@@ -150,8 +156,9 @@ fn start_embedded_server() -> Option<(std::process::Child, std::path::PathBuf)> 
                         write_server_port(port);
                         return Some((child, server_dir));
                     }
-                    eprintln!("[SERVER] Serveur pas prêt sur port {}, essai du port suivant", port);
-                    // Le processus sera nettoyé par le système
+                    eprintln!("[SERVER] Serveur pas prêt sur port {}, kill et essai du port suivant", port);
+                    let _ = child.kill();
+                    let _ = child.wait();
                 }
             }
             Err(e) => {
@@ -183,6 +190,7 @@ struct ConnectionRequest {
 #[allow(dead_code)]
 struct AppState {
     device_id: String,
+    data_dir: std::path::PathBuf,
     session_manager: Arc<Mutex<Option<SessionManager>>>,
     config: Arc<Mutex<Config>>,
     pending_requests: Arc<Mutex<Vec<ConnectionRequest>>>,
@@ -192,13 +200,14 @@ struct AppState {
     file_transfer_manager: Arc<Mutex<FileTransferManager>>,
     active_capturer: Arc<Mutex<Option<Arc<Mutex<Box<dyn ScreenCapturer>>>>>>,
     active_encoder: Arc<Mutex<Option<Arc<Mutex<Box<dyn VideoEncoder>>>>>>,
+    /// Clé de session E2E partagée (dérivée via X25519 ECDH lors du handshake)
+    e2e_session_key: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct MouseEvent {
     x: i32,
     y: i32,
-    #[allow(dead_code)]
     button: String,
     r#type: String,
     #[serde(default)]
@@ -224,6 +233,9 @@ struct KeyModifiers {
     alt: bool,
     meta: bool,
 }
+
+// Commandes Settings importées depuis settings_commands.rs
+use settings_commands::{load_settings, save_settings};
 
 // Commandes Storage importées depuis storage_commands.rs
 use storage_commands::{
@@ -280,6 +292,12 @@ fn start_lan_discovery(
                             let peer_id = parts[0];
                             // Ignorer son propre broadcast
                             if peer_id == own_device_id {
+                                continue;
+                            }
+                            // Rejeter les device_id invalides (injection LAN)
+                            if peer_id.len() < 4 || peer_id.len() > 64
+                                || !peer_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+                            {
                                 continue;
                             }
                             let peer_port: u16 = parts[1].parse().unwrap_or(9000);
@@ -664,11 +682,48 @@ async fn start_streaming(
             diag_log(&format!("start_streaming: data_channel test = {:?}", dc_test.is_ok()));
             if let Err(ref e) = dc_test {
                 diag_log(&format!("start_streaming: data_channel ERREUR: {}", e));
-                // Notifier l'UI
+                // Notifier l'UI (message sérialisé via serde_json pour éviter injection JS)
                 if let Some(w) = app_handle.get_webview_window("main") {
-                    let _ = w.eval(format!("alert('STREAMING: Data channel non prêt: {}');", e));
+                    if let Ok(msg) = serde_json::to_string(&format!("STREAMING: Data channel non prêt: {}", e)) {
+                        let _ = w.eval(format!("alert({});", msg));
+                    }
                 }
             }
+
+            // --- E2E Key Exchange (X25519 ECDH) ---
+            // Le contrôleur génère sa paire et envoie sa clé publique au viewer.
+            // Le viewer répond via KeyExchangeAccept (géré dans start_receiving).
+            // Le secret partagé est stocké dans e2e_session_key.
+            let kex_private_key: Option<Vec<u8>> = {
+                let kex = KeyExchange::new();
+                match kex.generate_keypair() {
+                    Ok((priv_key, pub_key)) => {
+                        let init_msg = ControlMessage::KeyExchangeInit { public_key: pub_key };
+                        match init_msg.to_bytes() {
+                            Ok(bytes) => {
+                                if let Err(e) = webrtc.send_data(&bytes).await {
+                                    diag_log(&format!("KEx: erreur envoi KeyExchangeInit: {}", e));
+                                    None
+                                } else {
+                                    diag_log("KEx: KeyExchangeInit envoyé au viewer");
+                                    Some(priv_key)
+                                }
+                            }
+                            Err(e) => { diag_log(&format!("KEx: erreur sérialisation: {}", e)); None }
+                        }
+                    }
+                    Err(e) => { diag_log(&format!("KEx: erreur génération keypair: {}", e)); None }
+                }
+            };
+            // Stocker la clé privée temporaire pour que start_input_handler puisse finaliser l'échange
+            if let Some(ref priv_key) = kex_private_key {
+                let mut key_guard = state.e2e_session_key.lock().await;
+                // Tag spécial: on stocke la clé privée avec préfixe "PENDING:" jusqu'à réception de KeyExchangeAccept
+                let mut tagged = b"PENDING:".to_vec();
+                tagged.extend_from_slice(priv_key);
+                *key_guard = Some(tagged);
+            }
+            diag_log("start_streaming: KEx initié (non bloquant)");
 
             // Créer capturer et encoder
             let capturer = screen_capture::create_capturer()
@@ -683,12 +738,24 @@ async fn start_streaming(
             let preview_window = app_handle.get_webview_window("main");
 
             // Créer streamer avec callback local pour le preview sur le PC contrôlé
-            let mut streamer = Streamer::new(
+            // La session_key E2E sera disponible si le viewer a déjà répondu à KeyExchangeInit
+            let initial_session_key: Option<Vec<u8>> = {
+                let key_guard = state.e2e_session_key.lock().await;
+                key_guard.as_ref().and_then(|k| {
+                    if k.starts_with(b"PENDING:") { None } else { Some(k.clone()) }
+                })
+            };
+            let mut streamer_builder = Streamer::new(
                 capturer,
                 encoder,
                 webrtc.clone(),
                 30,
-            );
+            ).with_adaptive_bitrate(AdaptiveBitrateController::new());
+            if let Some(key) = initial_session_key {
+                diag_log("start_streaming: chiffrement E2E actif dès le début");
+                streamer_builder = streamer_builder.with_session_key(key);
+            }
+            let mut streamer = streamer_builder;
 
             // Stocker le capturer partagé pour le switch de moniteur
             let shared_capturer = streamer.capturer();
@@ -787,8 +854,23 @@ async fn start_receiving(
 
             diag_log("start_receiving: fenêtre + webrtc OK");
 
-            // Créer receiver
-            let receiver = Arc::new(Receiver::new(webrtc.clone()));
+            // Créer receiver (la clé E2E sera disponible si le contrôleur a déjà envoyé KeyExchangeInit)
+            let initial_rx_key: Option<Vec<u8>> = {
+                let key_guard = state.e2e_session_key.lock().await;
+                key_guard.as_ref().and_then(|k| {
+                    if k.starts_with(b"PENDING:") { None } else { Some(k.clone()) }
+                })
+            };
+            let mut recv_builder = Receiver::new(webrtc.clone());
+            if let Some(key) = initial_rx_key {
+                diag_log("start_receiving: chiffrement E2E actif");
+                recv_builder = recv_builder.with_session_key(key);
+            }
+            let receiver = Arc::new(recv_builder);
+
+            // Référence partagée pour que le callback message puisse gérer KeyExchangeInit
+            let webrtc_for_kex = webrtc.clone();
+            let e2e_key_for_rx = state.e2e_session_key.clone();
 
             // Fenêtre pour les messages non-vidéo (display list, chat, clipboard)
             let msg_window = app_handle.get_webview_window("main");
@@ -816,35 +898,65 @@ async fn start_receiving(
                 },
                 move |msg| {
                     // Dispatcher les messages non-vidéo vers l'UI via CustomEvents
-                    if let Some(ref w) = msg_window {
-                        match &msg {
-                            ControlMessage::DisplayListResponse { displays } => {
-                                if let Ok(json) = serde_json::to_string(displays) {
-                                    let js = format!(
-                                        "window.dispatchEvent(new CustomEvent('ghosthand-display-list', {{ detail: {} }}));",
-                                        json
-                                    );
-                                    let _ = w.eval(&js);
+                    match msg {
+                        ControlMessage::KeyExchangeInit { public_key: remote_pub } => {
+                            // Viewer répond au KeyExchangeInit du contrôleur
+                            let kex = KeyExchange::new();
+                            let webrtc_kex = webrtc_for_kex.clone();
+                            let key_store = e2e_key_for_rx.clone();
+                            tauri::async_runtime::spawn(async move {
+                                match kex.generate_keypair() {
+                                    Ok((priv_key, pub_key)) => {
+                                        match kex.derive_shared_secret(&priv_key, &remote_pub) {
+                                            Ok(shared) => {
+                                                let accept = ControlMessage::KeyExchangeAccept { public_key: pub_key };
+                                                if let Ok(bytes) = accept.to_bytes() {
+                                                    let _ = webrtc_kex.send_data(&bytes).await;
+                                                }
+                                                *key_store.lock().await = Some(shared);
+                                                println!("[CRYPTO] Viewer: clé E2E dérivée — AES-256-GCM actif");
+                                            }
+                                            Err(e) => eprintln!("[CRYPTO] Viewer: erreur dérivation: {}", e),
+                                        }
+                                    }
+                                    Err(e) => eprintln!("[CRYPTO] Viewer: erreur keypair: {}", e),
                                 }
-                            }
-                            ControlMessage::ChatMessage { from, text, timestamp } => {
-                                let js = format!(
-                                    "window.dispatchEvent(new CustomEvent('ghosthand-chat-message', {{ detail: {{ from: '{}', text: '{}', timestamp: {} }} }}));",
-                                    from.replace('\'', "\\'"),
-                                    text.replace('\'', "\\'"),
-                                    timestamp
-                                );
-                                let _ = w.eval(&js);
-                            }
-                            ControlMessage::ClipboardSync { content } => {
-                                let js = format!(
-                                    "window.dispatchEvent(new CustomEvent('ghosthand-clipboard-sync', {{ detail: {{ content: '{}' }} }}));",
-                                    content.replace('\'', "\\'")
-                                );
-                                let _ = w.eval(&js);
-                            }
-                            other => {
-                                println!("[RECEIVER] Message non géré: {:?}", other);
+                            });
+                        }
+                        other => {
+                            if let Some(ref w) = msg_window {
+                                match &other {
+                                    ControlMessage::DisplayListResponse { displays } => {
+                                        if let Ok(json) = serde_json::to_string(displays) {
+                                            let js = format!(
+                                                "window.dispatchEvent(new CustomEvent('ghosthand-display-list', {{ detail: {} }}));",
+                                                json
+                                            );
+                                            let _ = w.eval(&js);
+                                        }
+                                    }
+                                    ControlMessage::ChatMessage { from, text, timestamp } => {
+                                        if let Ok(detail) = serde_json::to_string(&serde_json::json!({
+                                            "from": from, "text": text, "timestamp": timestamp
+                                        })) {
+                                            let js = format!(
+                                                "window.dispatchEvent(new CustomEvent('ghosthand-chat-message', {{ detail: {} }}));",
+                                                detail
+                                            );
+                                            let _ = w.eval(&js);
+                                        }
+                                    }
+                                    ControlMessage::ClipboardSync { content } => {
+                                        if let Ok(detail) = serde_json::to_string(&serde_json::json!({ "content": content })) {
+                                            let js = format!(
+                                                "window.dispatchEvent(new CustomEvent('ghosthand-clipboard-sync', {{ detail: {} }}));",
+                                                detail
+                                            );
+                                            let _ = w.eval(&js);
+                                        }
+                                    }
+                                    _ => println!("[RECEIVER] Message non géré: {:?}", other),
+                                }
                             }
                         }
                     }
@@ -904,11 +1016,36 @@ async fn start_input_handler(
             let handler_clone = handler.clone();
             let capturer_ref = state.active_capturer.clone();
             let encoder_ref = state.active_encoder.clone();
+            let e2e_key_ref = state.e2e_session_key.clone();
 
             tokio::spawn(async move {
                 while let Some(data) = rx.recv().await {
                     if let Ok(msg) = ControlMessage::from_bytes(&data) {
                         match msg {
+                            ControlMessage::KeyExchangeAccept { public_key: remote_pub } => {
+                                // Finaliser l'échange de clés E2E
+                                let pending = {
+                                    let guard = e2e_key_ref.lock().await;
+                                    guard.as_ref().and_then(|k| {
+                                        if k.starts_with(b"PENDING:") {
+                                            Some(k[8..].to_vec()) // Extraire la clé privée
+                                        } else { None }
+                                    })
+                                };
+                                if let Some(priv_key) = pending {
+                                    let kex = KeyExchange::new();
+                                    match kex.derive_shared_secret(&priv_key, &remote_pub) {
+                                        Ok(shared) => {
+                                            *e2e_key_ref.lock().await = Some(shared.clone());
+                                            println!("[CRYPTO] Clé E2E dérivée — chiffrement AES-256-GCM actif");
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[CRYPTO] Erreur dérivation secret: {}", e);
+                                            *e2e_key_ref.lock().await = None;
+                                        }
+                                    }
+                                }
+                            }
                             ControlMessage::SelectDisplay { display_id } => {
                                 // Switch de moniteur
                                 let cap_opt = capturer_ref.lock().await;
@@ -1079,14 +1216,16 @@ async fn start_listening_for_requests(
                             drop(requests_guard); // Libérer explicitement le lock
 
                             // Envoyer les données à l'UI via window.eval() + DOM CustomEvent
-                            // Note: Tauri v2 window.emit() + listen() ne fonctionne pas,
-                            // donc on utilise window.eval() qui est confirmé fonctionnel.
-                            let js_code = format!(
-                                "window.dispatchEvent(new CustomEvent('ghosthand-connect-request', {{ detail: {{ from: '{}', timestamp: {} }} }}));",
-                                from, now
-                            );
-                            if let Err(e) = window.eval(&js_code) {
-                                eprintln!("[LISTENER] Erreur envoi event UI: {}", e);
+                            if let Ok(detail) = serde_json::to_string(&serde_json::json!({
+                                "from": from, "timestamp": now
+                            })) {
+                                let js_code = format!(
+                                    "window.dispatchEvent(new CustomEvent('ghosthand-connect-request', {{ detail: {} }}));",
+                                    detail
+                                );
+                                if let Err(e) = window.eval(&js_code) {
+                                    eprintln!("[LISTENER] Erreur envoi event UI: {}", e);
+                                }
                             }
                         }
                     }
@@ -1293,11 +1432,33 @@ fn main() {
     let server_process: Arc<std::sync::Mutex<Option<(std::process::Child, std::path::PathBuf)>>> =
         Arc::new(std::sync::Mutex::new(start_embedded_server()));
 
-    // Initialiser la configuration
-    let config = Config::default();
+    // Calculer data_dir en premier (utilisé pour Device ID + storage + settings)
+    let data_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.join("data")))
+        .unwrap_or_else(|| std::path::PathBuf::from("./data"));
+    let _ = std::fs::create_dir_all(&data_dir);
 
-    // Générer le Device ID
-    let device_id = generate_device_id();
+    // Charger le Device ID persisté (ou le générer et le sauvegarder)
+    let device_id = {
+        let id_file = data_dir.join("device_id.txt");
+        match std::fs::read_to_string(&id_file) {
+            Ok(id) if !id.trim().is_empty() => id.trim().to_string(),
+            _ => {
+                let new_id = generate_device_id();
+                let _ = std::fs::write(&id_file, &new_id);
+                new_id
+            }
+        }
+    };
+
+    // Initialiser la configuration (charger depuis settings.json si présent)
+    let config = {
+        let saved = settings_commands::load_settings_from_disk(&data_dir);
+        let mut cfg = Config::default();
+        saved.apply_to_config(&mut cfg);
+        cfg
+    };
 
     // Initialiser le logger d'audit
     let log_dir = std::env::current_exe()
@@ -1322,11 +1483,6 @@ fn main() {
     }
 
     // Initialiser le storage persistant
-    let data_dir = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|p| p.join("data")))
-        .unwrap_or_else(|| std::path::PathBuf::from("./data"));
-
     if let Err(e) = init_global_storage(&data_dir) {
         eprintln!("⚠️  Erreur initialisation storage: {}", e);
     } else {
@@ -1367,6 +1523,7 @@ fn main() {
     // Créer l'état global
     let app_state = AppState {
         device_id: device_id.clone(),
+        data_dir: data_dir.clone(),
         session_manager: Arc::new(Mutex::new(None)),
         config: Arc::new(Mutex::new(config)),
         pending_requests: Arc::new(Mutex::new(Vec::new())),
@@ -1376,6 +1533,7 @@ fn main() {
         file_transfer_manager: Arc::new(Mutex::new(FileTransferManager::new())),
         active_capturer: Arc::new(Mutex::new(None)),
         active_encoder: Arc::new(Mutex::new(None)),
+        e2e_session_key: Arc::new(Mutex::new(None)),
     };
 
     // Cloner pour les closures
@@ -1419,6 +1577,9 @@ fn main() {
             change_resolution,
             // File transfer
             send_file,
+            // Settings commands
+            load_settings,
+            save_settings,
             // Storage commands
             get_connection_history,
             get_known_peers,

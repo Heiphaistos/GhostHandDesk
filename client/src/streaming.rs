@@ -3,6 +3,7 @@
 //! Ce module gère la boucle de capture, encodage et transmission vidéo.
 
 use crate::adaptive_bitrate::AdaptiveBitrateController;
+use crate::crypto::{CryptoManager, EncryptedData};
 use crate::error::{GhostHandError, Result};
 use crate::input_control::{InputController, MouseButton, MouseEvent as InputMouseEvent, KeyboardEvent as InputKeyboardEvent, KeyModifiers};
 use crate::network::WebRTCConnection;
@@ -15,19 +16,11 @@ use tokio::sync::Mutex;
 use tokio::time::{interval, Duration};
 use tracing::{debug, info, warn};
 
-// Diagnostic temporaire - écriture directe dans un fichier log
+/// Magic byte indiquant un paquet chiffré AES-256-GCM (au-dessus de DTLS)
+const ENCRYPTED_MAGIC: u8 = 0xE2;
+
 fn stream_diag(msg: &str) {
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true).append(true)
-        .open("C:\\Users\\Momo\\Documents\\GhostHandDesk\\diag.log")
-    {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let _ = f.write_all(format!("[{}] {}\n", ts, msg).as_bytes());
-    }
+    tracing::debug!("[STREAM] {}", msg);
 }
 
 /// Callback pour recevoir les frames localement (preview sur le PC contrôlé)
@@ -42,6 +35,8 @@ pub struct Streamer {
     running: Arc<AtomicBool>,
     adaptive_controller: Option<Arc<Mutex<AdaptiveBitrateController>>>,
     local_frame_callback: Option<LocalFrameCallback>,
+    /// Clé de session E2E partagée (None = pas de chiffrement applicatif, DTLS-SRTP actif)
+    session_key: Option<Arc<Vec<u8>>>,
 }
 
 impl Streamer {
@@ -60,7 +55,14 @@ impl Streamer {
             running: Arc::new(AtomicBool::new(false)),
             adaptive_controller: None,
             local_frame_callback: None,
+            session_key: None,
         }
+    }
+
+    /// Activer le chiffrement E2E avec la clé de session dérivée (X25519 ECDH)
+    pub fn with_session_key(mut self, key: Vec<u8>) -> Self {
+        self.session_key = Some(Arc::new(key));
+        self
     }
 
     /// Activer le contrôle adaptatif du bitrate
@@ -105,11 +107,34 @@ impl Streamer {
 
         // Task d'envoi séparée — tourne indépendamment de la boucle de capture
         let webrtc = self.webrtc.clone();
+        let sender_key = self.session_key.clone();
+        let crypto = CryptoManager::new();
         tokio::spawn(async move {
             while let Some(bytes) = frame_rx.recv().await {
                 let start = std::time::Instant::now();
+
+                // Chiffrer si clé de session disponible
+                let payload = if let Some(ref key) = sender_key {
+                    match crypto.encrypt(key, &bytes) {
+                        Ok(enc) => {
+                            // Format: [0xE2][nonce(12)][ciphertext]
+                            let mut envelope = Vec::with_capacity(1 + enc.nonce.len() + enc.ciphertext.len());
+                            envelope.push(ENCRYPTED_MAGIC);
+                            envelope.extend_from_slice(&enc.nonce);
+                            envelope.extend_from_slice(&enc.ciphertext);
+                            envelope
+                        }
+                        Err(e) => {
+                            stream_diag(&format!("SENDER: erreur chiffrement: {}", e));
+                            bytes // Fallback non chiffré
+                        }
+                    }
+                } else {
+                    bytes
+                };
+
                 let webrtc_guard = webrtc.lock().await;
-                if let Err(e) = webrtc_guard.send_data(&bytes).await {
+                if let Err(e) = webrtc_guard.send_data(&payload).await {
                     stream_diag(&format!("SENDER: erreur envoi: {}", e));
                 }
                 last_send_ns_clone.store(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -231,6 +256,8 @@ impl Streamer {
 /// Receiver : réception et décodage vidéo
 pub struct Receiver {
     webrtc: Arc<Mutex<WebRTCConnection>>,
+    /// Clé de session E2E pour déchiffrement (synchronisée avec Streamer distant)
+    session_key: Option<Arc<Vec<u8>>>,
 }
 
 impl Receiver {
@@ -238,7 +265,14 @@ impl Receiver {
     pub fn new(webrtc: WebRTCConnection) -> Self {
         Self {
             webrtc: Arc::new(Mutex::new(webrtc)),
+            session_key: None,
         }
+    }
+
+    /// Activer le déchiffrement E2E avec la clé de session
+    pub fn with_session_key(mut self, key: Vec<u8>) -> Self {
+        self.session_key = Some(Arc::new(key));
+        self
     }
 
     /// Démarrer la réception avec callbacks pour vidéo et messages de contrôle
@@ -271,10 +305,39 @@ impl Receiver {
 
         let frame_cb = Arc::new(frame_callback);
         let msg_cb = Arc::new(message_callback);
+        let receiver_key = self.session_key.clone();
+        let recv_crypto = CryptoManager::new();
         tokio::spawn(async move {
             let mut reassembly: Option<(usize, Vec<u8>)> = None;
 
-            while let Some(data) = rx.recv().await {
+            while let Some(raw_data) = rx.recv().await {
+                // Déchiffrer si paquet chiffré (magic byte 0xE2) et clé disponible
+                let data = if raw_data.first() == Some(&ENCRYPTED_MAGIC) {
+                    if let Some(ref key) = receiver_key {
+                        // Format: [0xE2][nonce(12)][ciphertext]
+                        if raw_data.len() >= 13 {
+                            let nonce = raw_data[1..13].to_vec();
+                            let ciphertext = raw_data[13..].to_vec();
+                            let enc = EncryptedData { nonce, ciphertext };
+                            match recv_crypto.decrypt(key, &enc) {
+                                Ok(plain) => plain,
+                                Err(e) => {
+                                    stream_diag(&format!("RECEIVER: erreur déchiffrement: {}", e));
+                                    continue;
+                                }
+                            }
+                        } else {
+                            stream_diag("RECEIVER: paquet chiffré trop court, ignoré");
+                            continue;
+                        }
+                    } else {
+                        // Pas de clé: on essaie de traiter tel quel (rétrocompatibilité)
+                        raw_data
+                    }
+                } else {
+                    raw_data
+                };
+
                 // Vérifier si c'est un message fragmenté
                 if data.len() >= 2 && data[0] == 0xFF {
                     match data[1] {

@@ -26,6 +26,10 @@ type Hub struct {
 
 	// Mutex pour protéger l'accès concurrent
 	mu sync.RWMutex
+
+	// pendingConnections tracks active password handshake pairs: targetID -> fromID
+	pendingConnections map[string]string
+	pcMu               sync.Mutex
 }
 
 // Client représente un client WebSocket connecté
@@ -54,11 +58,41 @@ type BroadcastMessage struct {
 // NewHub crée un nouveau hub
 func NewHub() *Hub {
 	return &Hub{
-		clients:    make(map[string]*Client),
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
-		broadcast:  make(chan *BroadcastMessage),
+		clients:            make(map[string]*Client),
+		register:           make(chan *Client),
+		unregister:         make(chan *Client),
+		broadcast:          make(chan *BroadcastMessage),
+		pendingConnections: make(map[string]string),
 	}
+}
+
+// RegisterPendingConnection enregistre une paire fromID→targetID en attente de handshake
+func (h *Hub) RegisterPendingConnection(targetID, fromID string) {
+	h.pcMu.Lock()
+	h.pendingConnections[targetID] = fromID
+	h.pcMu.Unlock()
+}
+
+// IsPeerAuthorized vérifie que senderID est bien partie de la paire en cours avec peerID
+func (h *Hub) IsPeerAuthorized(senderID, peerID string) bool {
+	h.pcMu.Lock()
+	defer h.pcMu.Unlock()
+	// Sens 1: sender est le "from", peer est le "target"
+	if from, ok := h.pendingConnections[peerID]; ok && from == senderID {
+		return true
+	}
+	// Sens 2: sender est le "target", peer est le "from"
+	if from, ok := h.pendingConnections[senderID]; ok && from == peerID {
+		return true
+	}
+	return false
+}
+
+// ClearPendingConnection supprime la paire après établissement ou timeout
+func (h *Hub) ClearPendingConnection(targetID string) {
+	h.pcMu.Lock()
+	delete(h.pendingConnections, targetID)
+	h.pcMu.Unlock()
 }
 
 // Run démarre la boucle principale du hub
@@ -472,6 +506,9 @@ func (c *Client) handleConnectRequest(msg *models.Message) {
 		},
 	}
 
+	// Enregistrer la paire pour validation des messages password
+	c.Hub.RegisterPendingConnection(req.TargetID, c.ID)
+
 	// Transférer la demande au client cible
 	c.Hub.SendToClient(req.TargetID, notification)
 	log.Printf("[HUB] Demande de connexion transférée de %s vers %s", c.ID, req.TargetID)
@@ -496,6 +533,7 @@ func (c *Client) handleConnectionResponse(msg *models.Message) {
 			return
 		}
 		log.Printf("[CLIENT %s] A accepté la connexion de %s", c.ID, accepted.PeerID)
+		c.Hub.ClearPendingConnection(c.ID)
 		c.Hub.SendToClient(accepted.PeerID, msg)
 
 	case models.TypeConnectionRejected:
@@ -510,6 +548,7 @@ func (c *Client) handleConnectionResponse(msg *models.Message) {
 			return
 		}
 		log.Printf("[CLIENT %s] A rejeté la connexion de %s: %s", c.ID, rejected.PeerID, rejected.Reason)
+		c.Hub.ClearPendingConnection(c.ID)
 		c.Hub.SendToClient(rejected.PeerID, msg)
 	}
 }
@@ -533,6 +572,12 @@ func (c *Client) handlePasswordMessage(msg *models.Message) {
 
 	if peerMsg.PeerID == "" {
 		log.Printf("[CLIENT] Password message sans peer_id")
+		return
+	}
+
+	// Vérifier que l'expéditeur fait partie de la paire de connexion autorisée
+	if !c.Hub.IsPeerAuthorized(c.ID, peerMsg.PeerID) {
+		log.Printf("[CLIENT %s] ❌ Tentative de routing %s non autorisée vers %s", c.ID, msg.Type, peerMsg.PeerID)
 		return
 	}
 

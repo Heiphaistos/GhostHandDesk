@@ -367,7 +367,9 @@ impl Drop for SignalingClient {
         for task in self.tasks.drain(..) {
             task.abort();
         }
-        debug!("SignalingClient: {} tasks nettoyées", self.tasks.capacity());
+        let count = self.tasks.len();
+        self.tasks.drain(..).for_each(|t| t.abort());
+        debug!("SignalingClient: {} tasks nettoyées", count);
     }
 }
 
@@ -927,7 +929,11 @@ impl SessionManager {
                             if from == target_id {
                                 debug!("ICE candidate reçu de {}", from);
                                 if let Some(candidate) = msg.get_str("candidate") {
-                                    webrtc_conn.add_ice_candidate(&candidate).await?;
+                                    if let Err(e) = validation::validate_ice_candidate(&candidate) {
+                                        warn!("ICE candidate invalide reçu de {}: {}", from, e);
+                                    } else {
+                                        webrtc_conn.add_ice_candidate(&candidate).await?;
+                                    }
                                 }
                             }
                         }
@@ -1089,7 +1095,11 @@ impl SessionManager {
                             if ice_from == from {
                                 debug!("ICE candidate reçu de {}", ice_from);
                                 if let Some(candidate) = msg.get_str("candidate") {
-                                    webrtc_conn.add_ice_candidate(&candidate).await?;
+                                    if let Err(e) = validation::validate_ice_candidate(&candidate) {
+                                        warn!("ICE candidate invalide reçu de {}: {}", ice_from, e);
+                                    } else {
+                                        webrtc_conn.add_ice_candidate(&candidate).await?;
+                                    }
                                 }
                             }
                         }

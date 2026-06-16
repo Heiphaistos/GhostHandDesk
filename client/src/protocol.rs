@@ -102,6 +102,14 @@ pub enum ControlMessage {
         displays: Vec<DisplayInfoProto>,
     },
 
+    // E2E Key exchange (X25519 ECDH — au-dessus de DTLS-SRTP)
+    KeyExchangeInit {
+        public_key: Vec<u8>,
+    },
+    KeyExchangeAccept {
+        public_key: Vec<u8>,
+    },
+
     // System
     Ping,
     Pong,

@@ -23,7 +23,7 @@ pub use adaptive_bitrate::{AdaptiveBitrateController, AdaptiveBitrateConfig, Ada
 pub use audit::{audit_log, audit_log_with_metadata, init_global_logger, AuditEvent, AuditLevel};
 pub use config::Config;
 pub use error::{GhostHandError, Result};
-pub use network::{SessionManager, generate_device_id, load_or_generate_device_id};
+pub use network::{SessionManager, generate_device_id};
 pub use storage::{
     global_storage, init_global_storage, ConnectionHistory, KnownPeer, Storage, StorageStats,
 };
