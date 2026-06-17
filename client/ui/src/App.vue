@@ -459,10 +459,20 @@ async function handleRejectRequest() {
 
 async function handleDisconnect() {
   try {
+    await invoke('stop_streaming').catch(() => {});
     await invoke('disconnect');
     connected.value = false;
     connectedTo.value = '';
     isControlled.value = false;
+    connectionError.value = '';
+    // Recréer la session pour permettre de nouvelles connexions
+    try {
+      await invoke('initialize_session');
+      await invoke('start_listening_for_requests');
+    } catch (e) {
+      console.error('Erreur réinitialisation session:', e);
+      connectionError.value = 'Reconnexion au serveur échouée. Redémarrez l\'application.';
+    }
   } catch (error) {
     console.error('Erreur déconnexion:', error);
   }

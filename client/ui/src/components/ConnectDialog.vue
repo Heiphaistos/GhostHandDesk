@@ -321,7 +321,7 @@ function openSettings() {
 }
 
 function showAbout() {
-  alert('GhostHandDesk v0.4.5\nBureau à distance open-source\n\nMade with ❤️ and Rust 🦀');
+  alert('GhostHandDesk v0.4.6\nBureau à distance open-source\n\nMade with ❤️ and Rust 🦀');
 }
 </script>
 
