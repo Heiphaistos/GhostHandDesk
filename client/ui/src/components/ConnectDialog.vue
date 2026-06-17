@@ -181,6 +181,7 @@ const emit = defineEmits<{
   connect: [targetId: string, password: string | null];
   serverChanged: [serverUrl: string];
   cancel: [];
+  openSettings: [];
 }>();
 
 // État local
@@ -316,11 +317,11 @@ function showHelp() {
 }
 
 function openSettings() {
-  console.log('Ouvrir les paramètres');
+  emit('openSettings');
 }
 
 function showAbout() {
-  alert('GhostHandDesk v0.4.4\nBureau à distance open-source\n\nMade with ❤️ and Rust 🦀');
+  alert('GhostHandDesk v0.4.5\nBureau à distance open-source\n\nMade with ❤️ and Rust 🦀');
 }
 </script>
 

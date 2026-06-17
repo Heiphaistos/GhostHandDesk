@@ -13,7 +13,7 @@ use ghost_hand_client::adaptive_bitrate::AdaptiveBitrateController;
 use ghost_hand_client::audit::{audit_log, init_global_logger, AuditEvent, AuditLevel};
 use ghost_hand_client::clipboard::ClipboardManager;
 use ghost_hand_client::config::{Config, VideoCodec};
-use ghost_hand_client::crypto::KeyExchange;
+use ghost_hand_client::crypto::{KeyExchange, CryptoManager};
 use ghost_hand_client::file_transfer::FileTransferManager;
 use ghost_hand_client::network::{generate_device_id, SessionManager};
 use ghost_hand_client::protocol::{ControlMessage, DisplayInfoProto};
@@ -631,6 +631,47 @@ async fn update_config(
 ) -> Result<(), String> {
     *state.config.lock().await = new_config;
     println!("[TAURI] Configuration mise à jour");
+    Ok(())
+}
+
+/// Définir (ou effacer) le mot de passe d'accès de cet appareil.
+/// Si `password` est None ou vide, le mot de passe est supprimé (connexions libres).
+/// Si `password` est fourni, il est hashé PBKDF2-SHA256 et stocké dans la config + sur disque.
+#[tauri::command]
+async fn set_device_password(
+    state: State<'_, AppState>,
+    password: Option<String>,
+) -> Result<(), String> {
+    let mut config = state.config.lock().await;
+    match password.as_deref().filter(|p| !p.is_empty()) {
+        Some(pwd) => {
+            ghost_hand_client::validation::validate_password(pwd)
+                .map_err(|e| e.to_string())?;
+            let crypto = CryptoManager::new();
+            let hash = crypto.hash_password(pwd).map_err(|e| e.to_string())?;
+            config.security_config.password_hash = Some(hash);
+            config.security_config.require_auth = true;
+        }
+        None => {
+            config.security_config.password_hash = None;
+            config.security_config.require_auth = false;
+        }
+    }
+    // Persister dans settings.json pour survivre aux redémarrages
+    let settings = settings_commands::AppSettings {
+        server_url: config.server_url.clone(),
+        stun_servers: config.stun_servers.clone(),
+        require_auth: config.security_config.require_auth,
+        password_hash: config.security_config.password_hash.clone(),
+    };
+    drop(config);
+    let path = state.data_dir.join("settings.json");
+    let _ = std::fs::create_dir_all(&state.data_dir);
+    let content = serde_json::to_string_pretty(&settings)
+        .map_err(|e| format!("Erreur sérialisation: {}", e))?;
+    std::fs::write(&path, content)
+        .map_err(|e| format!("Erreur écriture settings.json: {}", e))?;
+    println!("[TAURI] Mot de passe appareil {}", if settings.require_auth { "activé" } else { "désactivé" });
     Ok(())
 }
 
@@ -1630,6 +1671,7 @@ fn main() {
             // Settings commands
             load_settings,
             save_settings,
+            set_device_password,
             // Storage commands
             get_connection_history,
             get_known_peers,

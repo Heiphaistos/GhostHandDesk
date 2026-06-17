@@ -108,6 +108,7 @@
         @connect="handleConnect"
         @cancel="handleCancelConnect"
         @server-changed="handleServerChanged"
+        @open-settings="settingsOpen = true"
         :connecting="connecting"
         :error="connectionError"
       />
@@ -192,6 +193,7 @@ const networkInfo = ref<{ local_ip: string; port: string; server_url: string }>(
   port: '9000',
   server_url: '',
 });
+const currentServerUrl = ref('');
 
 // Statistiques système
 const sysStats = ref<SystemStats>({
@@ -373,6 +375,7 @@ onMounted(async () => {
 
     try {
       networkInfo.value = await invoke<any>('get_network_info');
+      currentServerUrl.value = networkInfo.value.server_url || '';
     } catch (e) {
       console.error('Erreur réseau:', e);
     }
@@ -490,30 +493,52 @@ async function handleServerChanged(_serverUrl: string) {
 
 async function handleSettingsUpdate(settings: any) {
   try {
-    const newConfig = {
-      server_url: settings.serverUrl,
-      stun_servers: settings.stunServers,
-      turn_servers: [],
-      video_config: {
-        framerate: settings.framerate,
-        codec: settings.codec,
-        bitrate: settings.bitrate,
-        hardware_acceleration: settings.hardwareAcceleration,
-        resolution: null,
+    // 1. Persister server_url + stun_servers sur disque
+    await invoke('save_settings', {
+      settings: {
+        server_url: settings.serverUrl,
+        stun_servers: settings.stunServers,
       },
-      network_config: {
-        max_packet_size: 65536,
-        connection_timeout: 30,
-        enable_ipv6: true,
+    });
+
+    // 2. Mettre à jour le reste de la config en mémoire (codec, bitrate, etc.)
+    await invoke('update_config', {
+      newConfig: {
+        server_url: settings.serverUrl,
+        stun_servers: settings.stunServers,
+        turn_servers: [],
+        video_config: {
+          framerate: settings.framerate,
+          codec: settings.codec,
+          bitrate: settings.bitrate,
+          hardware_acceleration: settings.hardwareAcceleration,
+          resolution: null,
+        },
+        network_config: {
+          max_packet_size: 65536,
+          connection_timeout: 30,
+          enable_ipv6: true,
+        },
+        security_config: {
+          e2e_encryption: settings.encryptData,
+          require_auth: settings.requirePassword,
+          cert_path: null,
+          password_hash: null,
+        },
       },
-      security_config: {
-        e2e_encryption: settings.encryptData,
-        require_auth: settings.requirePassword,
-        cert_path: null,
-        password_hash: null,
-      },
-    };
-    await invoke('update_config', { newConfig });
+    });
+
+    // 3. Définir / effacer le mot de passe de l'appareil
+    const pwd = settings.requirePassword && settings.connectionPassword
+      ? settings.connectionPassword
+      : null;
+    await invoke('set_device_password', { password: pwd });
+
+    // 4. Reconnecter si l'URL du serveur a changé
+    if (settings.serverUrl && settings.serverUrl !== currentServerUrl.value) {
+      await invoke('update_server_url', { serverUrl: settings.serverUrl });
+      currentServerUrl.value = settings.serverUrl;
+    }
   } catch (error) {
     console.error('Erreur settings:', error);
   }

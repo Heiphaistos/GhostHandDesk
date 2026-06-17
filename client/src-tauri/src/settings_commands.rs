@@ -10,6 +10,10 @@ use crate::AppState;
 pub struct AppSettings {
     pub server_url: String,
     pub stun_servers: Vec<String>,
+    #[serde(default)]
+    pub require_auth: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_hash: Option<String>,
 }
 
 impl AppSettings {
@@ -17,12 +21,16 @@ impl AppSettings {
         Self {
             server_url: config.server_url.clone(),
             stun_servers: config.stun_servers.clone(),
+            require_auth: config.security_config.require_auth,
+            password_hash: config.security_config.password_hash.clone(),
         }
     }
 
     pub fn apply_to_config(&self, config: &mut Config) {
         config.server_url = self.server_url.clone();
         config.stun_servers = self.stun_servers.clone();
+        config.security_config.require_auth = self.require_auth;
+        config.security_config.password_hash = self.password_hash.clone();
     }
 }
 
