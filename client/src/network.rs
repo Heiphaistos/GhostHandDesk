@@ -606,6 +606,26 @@ impl WebRTCConnection {
         }
     }
 
+    /// Attendre que le data channel soit disponible (pour le côté answerer)
+    /// Utile après `accept_connection` où le DC est reçu via un callback async.
+    pub async fn wait_for_data_channel(&self, timeout_ms: u64) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            {
+                let dc_lock = self.data_channel.read().await;
+                if dc_lock.is_some() {
+                    return Ok(());
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(GhostHandError::WebRTC(
+                    format!("Timeout {}ms: data channel non disponible", timeout_ms)
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Configure un callback pour recevoir les données du data channel
     pub async fn on_data_channel_message<F>(&self, callback: F) -> Result<()>
     where

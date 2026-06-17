@@ -85,8 +85,6 @@
         @wheel="handleWheel"
         @contextmenu.prevent
         tabindex="0"
-        @keydown="handleKeyDown"
-        @keyup="handleKeyUp"
       />
 
       <!-- Overlay de connexion -->
@@ -116,7 +114,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue';
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import ChatPanel from './ChatPanel.vue';
@@ -212,6 +210,30 @@ function onFullscreenChange() {
 }
 
 // Lifecycle
+// Listeners clavier au niveau document quand le streaming est actif.
+// Le canvas perd le focus dès qu'un bouton de la toolbar est cliqué —
+// attacher les handlers au document évite ce problème sans polluer le reste de l'appli.
+function docKeyDown(event: KeyboardEvent) {
+  const tag = (event.target as HTMLElement)?.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+  handleKeyDown(event);
+}
+function docKeyUp(event: KeyboardEvent) {
+  const tag = (event.target as HTMLElement)?.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+  handleKeyUp(event);
+}
+
+watch(streaming, (active) => {
+  if (active) {
+    document.addEventListener('keydown', docKeyDown);
+    document.addEventListener('keyup', docKeyUp);
+  } else {
+    document.removeEventListener('keydown', docKeyDown);
+    document.removeEventListener('keyup', docKeyUp);
+  }
+});
+
 onMounted(async () => {
   console.log('RemoteViewer monté, connexion:', props.connectionId);
   document.addEventListener('fullscreenchange', onFullscreenChange);
@@ -276,6 +298,8 @@ onMounted(async () => {
 
 onUnmounted(() => {
   document.removeEventListener('fullscreenchange', onFullscreenChange);
+  document.removeEventListener('keydown', docKeyDown);
+  document.removeEventListener('keyup', docKeyUp);
   if (videoUnlisten) videoUnlisten();
   if (chatUnlisten) chatUnlisten();
   if (clipboardUnlisten) clipboardUnlisten();

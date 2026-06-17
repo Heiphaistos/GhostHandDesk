@@ -216,7 +216,6 @@ struct MouseEvent {
     button: String,
     r#type: String,
     #[serde(default)]
-    #[allow(dead_code)]
     delta: i32,
 }
 
@@ -560,8 +559,8 @@ async fn send_mouse_event(
                     let click_bytes = click_msg.to_bytes().map_err(|e| format!("Erreur sérialisation click: {}", e))?;
                     webrtc.send_data(&click_bytes).await.map_err(|e| format!("Erreur envoi click: {}", e))?;
                 },
-                "wheel" => {
-                    let msg = ControlMessage::MouseScroll { delta: event.delta };
+                "scroll" | "wheel" => {
+                    let msg = ControlMessage::MouseScroll { delta: event.delta.clamp(-2000, 2000) };
                     let bytes = msg.to_bytes().map_err(|e| format!("Erreur sérialisation: {}", e))?;
                     webrtc.send_data(&bytes).await.map_err(|e| format!("Erreur envoi: {}", e))?;
                 },
@@ -1004,6 +1003,10 @@ async fn start_input_handler(
             let handler = Arc::new(InputHandler::new_with_resolution(res_w as i32, res_h as i32)
                 .map_err(|e| format!("Erreur création handler: {}", e))?);
             println!("[TAURI] InputHandler créé avec résolution {}x{}", res_w, res_h);
+
+            // Attendre que le data channel soit établi (race condition côté answerer)
+            webrtc.wait_for_data_channel(3000).await
+                .map_err(|e| format!("Data channel non disponible après 3s: {}", e))?;
 
             // Setup manuel du data channel callback (au lieu de attach_to_webrtc)
             // pour pouvoir aussi gérer SelectDisplay
