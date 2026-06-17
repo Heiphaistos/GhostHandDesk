@@ -16,7 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -25,6 +25,18 @@ import (
 	"github.com/heiphaistos44-crypto/GhostHandDesk/server/internal/signaling"
 	"github.com/joho/godotenv"
 )
+
+// extractIP extrait l'adresse IP sans le port depuis RemoteAddr
+// Prévient le bypass du rate-limiter par rotation de port source.
+func extractIP(remoteAddr string) string {
+	// RemoteAddr est de la forme "ip:port" ou "[::1]:port" pour IPv6
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		// Pas de port (cas inhabituel) — utiliser tel quel
+		return strings.TrimSpace(remoteAddr)
+	}
+	return host
+}
 
 // simpleRateLimiter implémente un rate limiter basique par IP
 type simpleRateLimiter struct {
@@ -201,11 +213,13 @@ func main() {
 
 	// Route de health check
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		if !httpLimiter.allow(r.RemoteAddr) {
+		if !httpLimiter.allow(extractIP(r.RemoteAddr)) {
 			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
 		w.WriteHeader(http.StatusOK)
 		if err := json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":  "healthy",
@@ -215,56 +229,23 @@ func main() {
 		}
 	})
 
-	// Route de statistiques avec pagination des clients
+	// Route de statistiques — NE PAS exposer les Device IDs (fuite de présence)
 	mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
-		if !httpLimiter.allow(r.RemoteAddr) {
+		if !httpLimiter.allow(extractIP(r.RemoteAddr)) {
 			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
 			return
 		}
 
-		// Parser les paramètres de pagination
-		page := 1
-		perPage := 50
-		if p := r.URL.Query().Get("page"); p != "" {
-			if v, err := strconv.Atoi(p); err == nil && v >= 1 {
-				page = v
-			}
-		}
-		if pp := r.URL.Query().Get("per_page"); pp != "" {
-			if v, err := strconv.Atoi(pp); err == nil && v >= 1 && v <= 100 {
-				perPage = v
-			}
-		}
-
-		// Récupérer tous les IDs et paginer
-		allIDs := hub.GetClientIDs()
-		totalClients := len(allIDs)
-		totalPages := (totalClients + perPage - 1) / perPage
-		if totalPages == 0 {
-			totalPages = 1
-		}
-
-		// Calculer les indices de pagination
-		start := (page - 1) * perPage
-		end := start + perPage
-		if start > totalClients {
-			start = totalClients
-		}
-		if end > totalClients {
-			end = totalClients
-		}
-
-		pagedIDs := allIDs[start:end]
+		// Sécurité : on retourne uniquement le compteur agrégé,
+		// jamais la liste des Device IDs (qui révèle quelles machines sont en ligne).
+		totalClients := hub.GetClientCount()
 
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		if err := json.NewEncoder(w).Encode(map[string]interface{}{
-			"total_clients":     totalClients,
-			"connected_clients": pagedIDs,
-			"page":              page,
-			"per_page":          perPage,
-			"total_pages":       totalPages,
-			"uptime":            time.Since(startTime).String(),
-			"max_clients":       cfg.MaxClients,
+			"total_clients": totalClients,
+			"uptime":        time.Since(startTime).String(),
+			"max_clients":   cfg.MaxClients,
 		}); err != nil {
 			log.Printf("[MAIN] Erreur encodage stats: %v", err)
 		}

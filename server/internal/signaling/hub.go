@@ -199,17 +199,13 @@ func (c *Client) ReadPump() {
 			break
 		}
 
-		// LOG DEBUG: Afficher le message brut reçu
-		log.Printf("[DEBUG %s] Message brut reçu: %s", c.ID, string(message))
-
 		// Parser le message
 		var msg models.Message
 		if err := json.Unmarshal(message, &msg); err != nil {
-			log.Printf("[CLIENT %s] ❌ Erreur de parsing: %v | Message: %s", c.ID, err, string(message))
+			// Ne pas logger le contenu brut du message en production (risque de fuite de données chiffrées)
+			log.Printf("[CLIENT %s] ❌ Erreur de parsing JSON (taille: %d bytes)", c.ID, len(message))
 			continue
 		}
-
-		log.Printf("[DEBUG %s] Message parsé: Type=%s", c.ID, msg.Type)
 
 		// Traiter le message
 		c.handleMessage(&msg)
@@ -281,10 +277,7 @@ func (c *Client) checkRateLimit() bool {
 		return false
 	}
 
-	// Log DEBUG: afficher compteur actuel (seulement en mode verbose)
-	if c.messageCount%10 == 1 || c.messageCount <= 3 {
-		log.Printf("[RATE_LIMIT] ✅ Client %s: %d/%d messages", c.ID, c.messageCount, c.maxMessagesPerMin)
-	}
+	// Pas de log debug en mode normal — trop verbeux en production
 
 	return true
 }
@@ -297,12 +290,8 @@ func (c *Client) handleMessage(msg *models.Message) {
 		return
 	}
 
-	log.Printf("[CLIENT %s] ✅ Message reçu: Type='%s' | Data présent=%v", c.ID, msg.Type, msg.Data != nil)
-
-	// Log spécial pour ConnectRequest
-	if msg.Type == models.TypeConnectRequest {
-		log.Printf("[DIAGNOSTIC] 🔍 ConnectRequest détecté pour client %s, passage au handler...", c.ID)
-	}
+	// Log minimal — ne pas logguer le contenu des données (peuvent contenir des infos sensibles)
+	log.Printf("[CLIENT %s] Message reçu: Type='%s'", c.ID, msg.Type)
 
 	switch msg.Type {
 	case models.TypeOffer:
@@ -437,25 +426,19 @@ func (c *Client) handleIceCandidate(msg *models.Message) {
 
 // handleConnectRequest traite une demande de connexion
 func (c *Client) handleConnectRequest(msg *models.Message) {
-	log.Printf("[DIAGNOSTIC] 🚀 handleConnectRequest APPELÉ pour client %s", c.ID)
-
 	data, err := json.Marshal(msg.Data)
 	if err != nil {
-		log.Printf("[CLIENT] ❌ Erreur marshal data: %v", err)
+		log.Printf("[CLIENT] Erreur marshal data: %v", err)
 		c.sendAck("ConnectRequest", "error", "Erreur de marshaling")
 		return
 	}
 
-	log.Printf("[DIAGNOSTIC] 📦 Data marshaled, taille: %d bytes | Contenu: %s", len(data), string(data))
-
 	var req models.ConnectRequestMessage
 	if err := json.Unmarshal(data, &req); err != nil {
-		log.Printf("[CLIENT] ❌ Erreur parsing connect request: %v | Data: %s", err, string(data))
+		log.Printf("[CLIENT] Erreur parsing connect request (taille: %d bytes)", len(data))
 		c.sendAck("ConnectRequest", "error", "Erreur de parsing")
 		return
 	}
-
-	log.Printf("[DIAGNOSTIC] ✅ ConnectRequest parsé: TargetID='%s', Password présent=%v", req.TargetID, req.Password != nil)
 
 	// Masquer le password dans les logs pour la sécurité
 	passwordMasked := "***"
@@ -619,7 +602,6 @@ func (c *Client) sendAck(messageType string, status string, message string) {
 	}
 	select {
 	case c.Send <- data:
-		log.Printf("[CLIENT %s] ACK envoyé: %s - %s", c.ID, messageType, status)
 	default:
 		log.Printf("[CLIENT %s] Canal saturé, ACK non envoyé", c.ID)
 	}
