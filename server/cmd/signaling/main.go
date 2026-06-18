@@ -229,15 +229,24 @@ func main() {
 		}
 	})
 
-	// Route de statistiques — NE PAS exposer les Device IDs (fuite de présence)
+	// Route de statistiques — admin uniquement (Bearer via STATS_TOKEN)
+	// SECURITE: compteur agrégé uniquement, jamais la liste des Device IDs (fuite de présence).
+	statsToken := os.Getenv("STATS_TOKEN")
 	mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
 		if !httpLimiter.allow(extractIP(r.RemoteAddr)) {
 			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
 			return
 		}
 
-		// Sécurité : on retourne uniquement le compteur agrégé,
-		// jamais la liste des Device IDs (qui révèle quelles machines sont en ligne).
+		// Auth Bearer obligatoire si STATS_TOKEN est défini en production
+		if statsToken != "" {
+			auth := r.Header.Get("Authorization")
+			if len(auth) < 8 || auth[:7] != "Bearer " || auth[7:] != statsToken {
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+
 		totalClients := hub.GetClientCount()
 
 		w.Header().Set("Content-Type", "application/json")
