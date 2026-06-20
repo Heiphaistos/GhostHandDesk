@@ -277,38 +277,9 @@ onUnmounted(() => {
 });
 
 async function connectToPeer(peer: DiscoveredPeer) {
-  // Vérifier si le peer est sur la même machine (même IP locale)
-  let localIp = '';
-  try {
-    const info = await invoke<any>('get_network_info');
-    localIp = info.local_ip || '';
-  } catch (e) {}
-
-  const isSameMachine = peer.ip === localIp || peer.ip === '127.0.0.1';
-
-  // Changer le serveur URL seulement si le peer est sur une AUTRE machine
-  if (!isSameMachine) {
-    const peerServerUrl = `ws://${peer.ip}:${peer.port}/ws`;
-    if (peerServerUrl !== currentServerUrl.value) {
-      changingServer.value = true;
-      serverError.value = '';
-      try {
-        await invoke('update_server_url', { serverUrl: peerServerUrl });
-        currentServerUrl.value = peerServerUrl;
-        serverUrl.value = peerServerUrl;
-        serverConnected.value = true;
-        emit('serverChanged', peerServerUrl);
-      } catch (e: any) {
-        serverError.value = e.message || e || 'Impossible de se connecter';
-        serverConnected.value = false;
-        changingServer.value = false;
-        return;
-      }
-      changingServer.value = false;
-    }
-  }
-
-  // Lancer la connexion vers le device
+  // Relay VPS : toujours utiliser le serveur configuré (VPS ou local).
+  // Le switch automatique vers le serveur local du pair est désactivé —
+  // les deux clients doivent être sur le même serveur pour que le relay fonctionne.
   emit('connect', peer.device_id, null);
 }
 
