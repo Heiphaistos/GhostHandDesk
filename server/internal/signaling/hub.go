@@ -30,6 +30,10 @@ type Hub struct {
 	// pendingConnections tracks active password handshake pairs: targetID -> fromID
 	pendingConnections map[string]string
 	pcMu               sync.Mutex
+
+	// relayPairs tracks bidirectional relay sessions: clientA → clientB et clientB → clientA
+	relayPairs map[string]string
+	relayMu    sync.Mutex
 }
 
 // Client représente un client WebSocket connecté
@@ -63,7 +67,36 @@ func NewHub() *Hub {
 		unregister:         make(chan *Client),
 		broadcast:          make(chan *BroadcastMessage),
 		pendingConnections: make(map[string]string),
+		relayPairs:         make(map[string]string),
 	}
+}
+
+// RegisterRelayPair enregistre une session relay bidirectionnelle entre deux clients
+func (h *Hub) RegisterRelayPair(id1, id2 string) {
+	h.relayMu.Lock()
+	h.relayPairs[id1] = id2
+	h.relayPairs[id2] = id1
+	h.relayMu.Unlock()
+	log.Printf("[HUB] Relay pair enregistré: %s ↔ %s", id1, id2)
+}
+
+// GetRelayPartner retourne l'ID du partenaire relay d'un client, ou ("", false) si non trouvé
+func (h *Hub) GetRelayPartner(clientID string) (string, bool) {
+	h.relayMu.Lock()
+	defer h.relayMu.Unlock()
+	partner, ok := h.relayPairs[clientID]
+	return partner, ok
+}
+
+// ClearRelayPair supprime la paire relay associée à un client (à la déconnexion)
+func (h *Hub) ClearRelayPair(clientID string) {
+	h.relayMu.Lock()
+	if partner, ok := h.relayPairs[clientID]; ok {
+		delete(h.relayPairs, clientID)
+		delete(h.relayPairs, partner)
+		log.Printf("[HUB] Relay pair supprimé: %s ↔ %s", clientID, partner)
+	}
+	h.relayMu.Unlock()
 }
 
 // RegisterPendingConnection enregistre une paire fromID→targetID en attente de handshake
@@ -116,6 +149,7 @@ func (h *Hub) Run() {
 				log.Printf("[HUB] Client désenregistré: %s (Total: %d)", client.ID, len(h.clients))
 			}
 			h.mu.Unlock()
+			h.ClearRelayPair(client.ID)
 
 		case msg := <-h.broadcast:
 			h.mu.RLock()
@@ -284,7 +318,13 @@ func (c *Client) checkRateLimit() bool {
 
 // handleMessage traite un message reçu
 func (c *Client) handleMessage(msg *models.Message) {
-	// Vérifier le rate limit
+	// TypeRelay est haute-fréquence (30fps) — bypasse le rate limit, sécurisé par relay pair auth
+	if msg.Type == models.TypeRelay {
+		c.handleRelay(msg)
+		return
+	}
+
+	// Vérifier le rate limit pour tous les autres messages
 	if !c.checkRateLimit() {
 		log.Printf("[CLIENT %s] ❌ Message rejeté (rate limit dépassé)", c.ID)
 		return
@@ -518,6 +558,8 @@ func (c *Client) handleConnectionResponse(msg *models.Message) {
 		log.Printf("[CLIENT %s] A accepté la connexion de %s", c.ID, accepted.PeerID)
 		c.Hub.ClearPendingConnection(c.ID)
 		c.Hub.SendToClient(accepted.PeerID, msg)
+		// Enregistrer la paire relay dès l'acceptation (avant que les données commencent à circuler)
+		c.Hub.RegisterRelayPair(c.ID, accepted.PeerID)
 
 	case models.TypeConnectionRejected:
 		data, err := json.Marshal(msg.Data)
@@ -583,6 +625,34 @@ func (c *Client) handlePing() {
 	default:
 		log.Printf("[CLIENT %s] Canal saturé, pong non envoyé", c.ID)
 	}
+}
+
+// handleRelay relaie des données binaires (base64) entre deux pairs d'une session relay
+func (c *Client) handleRelay(msg *models.Message) {
+	data, err := json.Marshal(msg.Data)
+	if err != nil {
+		return
+	}
+	var relay models.RelayMessage
+	if err := json.Unmarshal(data, &relay); err != nil {
+		return
+	}
+
+	// Sécurité : le champ "from" doit correspondre à l'identité du client connecté
+	if relay.From != c.ID {
+		log.Printf("[CLIENT %s] ❌ Relay 'from' spoofé: %s", c.ID, relay.From)
+		return
+	}
+
+	// Trouver le partenaire relay autorisé
+	partner, ok := c.Hub.GetRelayPartner(c.ID)
+	if !ok {
+		log.Printf("[CLIENT %s] ❌ Relay sans partenaire enregistré", c.ID)
+		return
+	}
+
+	// Transférer au partenaire (sans modifier le message)
+	c.Hub.SendToClient(partner, msg)
 }
 
 // sendAck envoie un acquittement (ACK) au client

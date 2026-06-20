@@ -143,6 +143,18 @@ impl SignalMessage {
         }
     }
 
+    /// Message de relay : données binaires (base64) à transférer via le VPS
+    pub fn relay_data(from: String, to: String, data_b64: String) -> Self {
+        Self {
+            msg_type: "Relay".to_string(),
+            data: Some(serde_json::json!({
+                "from": from,
+                "to": to,
+                "data": data_b64
+            })),
+        }
+    }
+
     // Méthodes utilitaires pour extraire les données
     pub fn get_str(&self, field: &str) -> Option<String> {
         self.data.as_ref()?.get(field)?.as_str().map(|s| s.to_string())
@@ -646,12 +658,121 @@ impl WebRTCConnection {
     }
 }
 
+/// Transport relay via VPS WebSocket — élimine les problèmes NAT traversal WebRTC
+/// Toutes les données binaires transitent par le serveur de signalement VPS.
+#[derive(Clone)]
+pub struct RelayTransport {
+    device_id: String,
+    peer_id: String,
+    /// Canal d'envoi vers le serveur de signalement (WebSocket sortant)
+    signaling_tx: mpsc::UnboundedSender<SignalMessage>,
+    /// Entrée du canal de données entrantes (partagée entre tous les clones)
+    pub incoming_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// Sortie du canal de données entrantes (prise exactement une fois via on_data_channel_message)
+    incoming_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<Vec<u8>>>>>,
+}
+
+impl RelayTransport {
+    pub fn new(
+        device_id: String,
+        peer_id: String,
+        signaling_tx: mpsc::UnboundedSender<SignalMessage>,
+    ) -> Self {
+        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        Self {
+            device_id,
+            peer_id,
+            signaling_tx,
+            incoming_tx,
+            incoming_rx: Arc::new(Mutex::new(Some(incoming_rx))),
+        }
+    }
+
+    /// Envoyer des données binaires au pair via le VPS (encodage base64)
+    pub async fn send_data(&self, data: &[u8]) -> Result<()> {
+        use base64::prelude::*;
+        let b64 = BASE64_STANDARD.encode(data);
+        self.signaling_tx
+            .send(SignalMessage::relay_data(
+                self.device_id.clone(),
+                self.peer_id.clone(),
+                b64,
+            ))
+            .map_err(|e| GhostHandError::Network(format!("Relay TX erreur: {}", e)))?;
+        Ok(())
+    }
+
+    /// Installer un callback pour les données entrantes (à appeler une seule fois)
+    pub async fn on_data_channel_message<F>(&self, callback: F) -> Result<()>
+    where
+        F: Fn(&[u8]) + Send + Sync + 'static,
+    {
+        let mut rx_guard = self.incoming_rx.lock().await;
+        let mut rx = rx_guard.take().ok_or_else(|| {
+            GhostHandError::Network("Relay RX déjà consommé".into())
+        })?;
+        let callback = Arc::new(callback);
+        tokio::spawn(async move {
+            while let Some(data) = rx.recv().await {
+                callback(&data);
+            }
+        });
+        Ok(())
+    }
+
+    /// Toujours prêt — le relay ne nécessite pas d'attente
+    pub async fn wait_for_data_channel(&self, _timeout_ms: u64) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Abstraction de transport : WebRTC P2P ou relay VPS
+#[derive(Clone)]
+pub enum Transport {
+    WebRTC(WebRTCConnection),
+    Relay(RelayTransport),
+}
+
+impl Transport {
+    pub async fn send_data(&self, data: &[u8]) -> Result<()> {
+        match self {
+            Transport::WebRTC(w) => w.send_data(data).await,
+            Transport::Relay(r) => r.send_data(data).await,
+        }
+    }
+
+    pub async fn on_data_channel_message<F>(&self, callback: F) -> Result<()>
+    where
+        F: Fn(&[u8]) + Send + Sync + 'static,
+    {
+        match self {
+            Transport::WebRTC(w) => w.on_data_channel_message(callback).await,
+            Transport::Relay(r) => r.on_data_channel_message(callback).await,
+        }
+    }
+
+    pub async fn wait_for_data_channel(&self, timeout_ms: u64) -> Result<()> {
+        match self {
+            Transport::WebRTC(w) => w.wait_for_data_channel(timeout_ms).await,
+            Transport::Relay(r) => r.wait_for_data_channel(timeout_ms).await,
+        }
+    }
+
+    /// Retourner l'incoming_tx pour le relay (None si WebRTC)
+    pub fn relay_incoming_tx(&self) -> Option<mpsc::UnboundedSender<Vec<u8>>> {
+        match self {
+            Transport::Relay(r) => Some(r.incoming_tx.clone()),
+            Transport::WebRTC(_) => None,
+        }
+    }
+}
+
 /// Session manager to handle the overall connection flow
 pub struct SessionManager {
     config: Config,
     device_id: String,
     signaling: Option<SignalingClient>,
-    pub webrtc: Option<WebRTCConnection>,
+    pub webrtc: Option<Transport>,
     // Buffer pour les demandes de connexion reçues
     pending_offers: Arc<Mutex<Vec<(String, String)>>>, // Vec<(from, offer_sdp)>
 }
@@ -824,155 +945,18 @@ impl SessionManager {
             }
         }
 
-        // 2. Créer WebRTC connection
-        let mut webrtc_conn = WebRTCConnection::new(self.config.clone()).await?;
-
-        // 3. Setup ICE candidate callback pour les envoyer au peer
+        // 2. Créer le transport relay via VPS (élimine les problèmes NAT traversal WebRTC)
         let signaling = self.signaling.as_ref().ok_or_else(|| {
             GhostHandError::Network("Not connected to signaling server".to_string())
         })?;
 
-        // Cloner le sender pour le callback (UnboundedSender est Clone)
-        let tx_for_ice = signaling.tx.as_ref().ok_or_else(|| {
-            GhostHandError::Network("Signaling sender not available".to_string())
+        let signaling_tx = signaling.tx.as_ref().ok_or_else(|| {
+            GhostHandError::Network("Signaling TX non disponible".to_string())
         })?.clone();
-        let device_id = self.device_id.clone();
-        let target_id_for_ice = target_id.clone();
 
-        webrtc_conn.peer_connection.on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
-            let tx = tx_for_ice.clone();
-            let device_id = device_id.clone();
-            let target_id = target_id_for_ice.clone();
-
-            Box::pin(async move {
-                if let Some(c) = candidate {
-                    match c.to_json() {
-                        Ok(candidate_json) => {
-                            let _ = tx.send(SignalMessage::ice_candidate(
-                                device_id,
-                                target_id,
-                                candidate_json.candidate,
-                                candidate_json.sdp_mid.unwrap_or_default(),
-                                candidate_json.sdp_mline_index.unwrap_or(0),
-                            ));
-                        }
-                        Err(e) => {
-                            warn!("Erreur sérialisation ICE candidate: {}", e);
-                        }
-                    }
-                }
-            })
-        }));
-
-        // Setup ICE gathering state callback
-        webrtc_conn.peer_connection.on_ice_gathering_state_change(Box::new(move |state: webrtc::ice_transport::ice_gatherer_state::RTCIceGathererState| {
-            Box::pin(async move {
-                match state {
-                    webrtc::ice_transport::ice_gatherer_state::RTCIceGathererState::Complete => {
-                        info!("ICE gathering terminé, tous les candidates collectés");
-                    }
-                    webrtc::ice_transport::ice_gatherer_state::RTCIceGathererState::Gathering => {
-                        info!("ICE gathering en cours...");
-                    }
-                    _ => {}
-                }
-            })
-        }));
-
-        // 4. Setup connection state callback
-        let (tx_connected, mut rx_connected) = mpsc::channel(1);
-        webrtc_conn.peer_connection.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
-            let tx = tx_connected.clone();
-            match state {
-                RTCPeerConnectionState::Connected => {
-                    info!("Connexion WebRTC établie avec succès");
-                    Box::pin(async move {
-                        let _ = tx.send(()).await;
-                    })
-                }
-                RTCPeerConnectionState::Failed => {
-                    error!("Connexion WebRTC échouée");
-                    Box::pin(async {})
-                }
-                RTCPeerConnectionState::Disconnected => {
-                    warn!("Connexion WebRTC déconnectée");
-                    Box::pin(async {})
-                }
-                _ => {
-                    debug!("État de connexion WebRTC: {:?}", state);
-                    Box::pin(async {})
-                }
-            }
-        }));
-
-        // 5. Créer et envoyer offer
-        info!("Création de l'offre WebRTC");
-        let offer_sdp = webrtc_conn.create_offer().await?;
-
-        self.signaling.as_ref().ok_or_else(|| {
-            GhostHandError::Network("Signaling disconnected".into())
-        })?.send(SignalMessage::offer(
-            self.device_id.clone(),
-            target_id.clone(),
-            offer_sdp,
-        )).await?;
-
-        info!("Offre envoyée à {}", target_id);
-
-        // 6. Boucle pour recevoir Answer + ICE candidates
-        let timeout = tokio::time::sleep(Duration::from_secs(CONNECTION_TIMEOUT_SECS));
-        tokio::pin!(timeout);
-
-        let mut answer_received = false;
-
-        loop {
-            tokio::select! {
-                msg_result = async {
-                    match self.signaling.as_mut() {
-                        Some(s) => s.receive().await,
-                        None => Err(GhostHandError::Network("Signaling disconnected".into())),
-                    }
-                } => {
-                    let msg = msg_result?;
-                    if msg.is_type("Answer") {
-                        if let Some(from) = msg.get_str("from") {
-                            if from == target_id {
-                                info!("Answer reçu de {}", from);
-                                if let Some(sdp) = msg.get_str("sdp") {
-                                    webrtc_conn.set_remote_description(&sdp, RTCSdpType::Answer).await?;
-                                    answer_received = true;
-                                }
-                            }
-                        }
-                    } else if msg.is_type("IceCandidate") {
-                        if let Some(from) = msg.get_str("from") {
-                            if from == target_id {
-                                debug!("ICE candidate reçu de {}", from);
-                                if let Some(candidate) = msg.get_str("candidate") {
-                                    if let Err(e) = validation::validate_ice_candidate(&candidate) {
-                                        warn!("ICE candidate invalide reçu de {}: {}", from, e);
-                                    } else {
-                                        webrtc_conn.add_ice_candidate(&candidate).await?;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                _ = &mut timeout => {
-                    error!("Timeout de connexion WebRTC");
-                    return Err(GhostHandError::Network("Connection timeout".into()));
-                }
-                _ = rx_connected.recv(), if answer_received => {
-                    info!("Connexion WebRTC établie avec {}", target_id);
-                    break;
-                }
-            }
-        }
-
-        // 6. Stocker la connexion
-        self.webrtc = Some(webrtc_conn);
-        info!("SessionManager: connexion WebRTC stockée");
+        let relay = RelayTransport::new(self.device_id.clone(), target_id.clone(), signaling_tx);
+        self.webrtc = Some(Transport::Relay(relay));
+        info!("Transport relay VPS créé pour {} — connexion prête", target_id);
 
         // AUDIT: Logger la connexion établie
         audit_log(
@@ -1136,8 +1120,8 @@ impl SessionManager {
             }
         }
 
-        // 7. Stocker la connexion
-        self.webrtc = Some(webrtc_conn);
+        // 7. Stocker la connexion (WebRTC legacy — remplacé par relay en v0.5.0)
+        self.webrtc = Some(Transport::WebRTC(webrtc_conn));
         info!("SessionManager: connexion WebRTC stockée");
 
         // AUDIT: Logger la connexion établie (incoming)
@@ -1246,62 +1230,18 @@ impl SessionManager {
             },
         );
 
-        info!("Acceptation envoyée, attente de l'Offer...");
+        info!("Acceptation envoyée, création du transport relay VPS...");
 
-        // 2. Attendre l'Offer
-        let timeout = tokio::time::sleep(Duration::from_secs(CONNECTION_TIMEOUT_SECS));
-        tokio::pin!(timeout);
+        // 2. Créer le transport relay — plus besoin d'attendre un Offer WebRTC
+        let signaling_tx = self.signaling.as_ref()
+            .ok_or_else(|| GhostHandError::Network("Signaling non connecté".into()))?
+            .tx.as_ref()
+            .ok_or_else(|| GhostHandError::Network("Signaling TX non disponible".into()))?
+            .clone();
 
-        let offer_sdp = loop {
-            tokio::select! {
-                msg_result = async {
-                    match self.signaling.as_mut() {
-                        Some(s) => s.receive().await,
-                        None => Err(GhostHandError::Network("Signaling disconnected".into())),
-                    }
-                } => {
-                    let msg = msg_result?;
-                    if msg.is_type("Offer") {
-                        if let Some(offer_from) = msg.get_str("from") {
-                            if offer_from == from {
-                                if let Some(sdp) = msg.get_str("sdp") {
-                                    info!("Offer reçu de {}", from);
-                                    break sdp;
-                                }
-                            }
-                        }
-                    } else if msg.is_type("Error") {
-                        // Gérer les messages d'erreur du serveur
-                        if let Some(error_msg) = msg.get_str("message") {
-                            return Err(GhostHandError::network_with_code(
-                                error_codes::NETWORK_INVALID_MESSAGE,
-                                format!("Erreur serveur: {}", error_msg)
-                            ));
-                        } else {
-                            return Err(GhostHandError::network_with_code(
-                                error_codes::NETWORK_INVALID_MESSAGE,
-                                "Erreur inconnue du serveur"
-                            ));
-                        }
-                    } else {
-                        // Ignorer les autres messages
-                        debug!("Message ignoré en attente d'Offer: {:?}", msg.msg_type);
-                    }
-                }
-                _ = &mut timeout => {
-                    return Err(GhostHandError::network_with_code(
-                        error_codes::NETWORK_TIMEOUT,
-                        format!(
-                            "Timeout après {} secondes en attente de l'Offer",
-                            CONNECTION_TIMEOUT_SECS
-                        )
-                    ));
-                }
-            }
-        };
-
-        // 3. Établir la connexion WebRTC
-        self.handle_connection_request(from, offer_sdp).await?;
+        let relay = RelayTransport::new(self.device_id.clone(), from.clone(), signaling_tx);
+        self.webrtc = Some(Transport::Relay(relay));
+        info!("Transport relay VPS créé pour {} — prêt à streamer", from);
 
         Ok(())
     }

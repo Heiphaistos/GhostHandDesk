@@ -16,6 +16,7 @@ use ghost_hand_client::config::{Config, VideoCodec};
 use ghost_hand_client::crypto::{KeyExchange, CryptoManager};
 use ghost_hand_client::file_transfer::FileTransferManager;
 use ghost_hand_client::network::{generate_device_id, SessionManager};
+use tokio::sync::mpsc as relay_mpsc;
 use ghost_hand_client::protocol::{ControlMessage, DisplayInfoProto};
 use ghost_hand_client::storage::{global_storage, init_global_storage, ConnectionHistory};
 use ghost_hand_client::streaming::{Streamer, Receiver, InputHandler};
@@ -207,6 +208,8 @@ struct AppState {
     e2e_session_key: Arc<Mutex<Option<Vec<u8>>>>,
     /// Handle sysinfo — maintenu entre les appels pour delta CPU correct
     sys_handle: Arc<std::sync::Mutex<System>>,
+    /// Canal entrant du transport relay (None si WebRTC ou déconnecté)
+    relay_data_tx: Arc<Mutex<Option<relay_mpsc::UnboundedSender<Vec<u8>>>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -462,7 +465,13 @@ async fn connect_to_device(
     diag_log(&format!("connect_to_device: appel session.connect_to_device({})...", target_id));
     match session.connect_to_device(target_id.clone(), password).await {
         Ok(_) => {
-            diag_log(&format!("connect_to_device: WebRTC établi avec {}", target_id));
+            diag_log(&format!("connect_to_device: relay VPS établi avec {}", target_id));
+            // Enregistrer le canal relay pour le listener de messages entrants
+            if let Some(transport) = &session.webrtc {
+                if let Some(tx) = transport.relay_incoming_tx() {
+                    *state.relay_data_tx.lock().await = Some(tx);
+                }
+            }
         }
         Err(e) => {
             diag_log(&format!("connect_to_device: ERREUR: {}", e));
@@ -521,6 +530,9 @@ async fn connect_to_device(
 #[tauri::command]
 async fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
     println!("[TAURI] Déconnexion demandée");
+
+    // Fermer le canal relay avant de détruire la session
+    *state.relay_data_tx.lock().await = None;
 
     // Supprimer la session
     *state.session_manager.lock().await = None;
@@ -1144,6 +1156,13 @@ async fn accept_connection(
         session.accept_connection(from.clone()).await
             .map_err(|e| format!("Erreur acceptation: {}", e))?;
 
+        // Enregistrer le canal relay pour le listener
+        if let Some(transport) = &session.webrtc {
+            if let Some(tx) = transport.relay_incoming_tx() {
+                *state.relay_data_tx.lock().await = Some(tx);
+            }
+        }
+
         // Retirer la demande de la liste des demandes en attente
         let mut requests = state.pending_requests.lock().await;
         requests.retain(|r| r.from != from);
@@ -1212,6 +1231,7 @@ async fn start_listening_for_requests(
     // Cloner les références nécessaires
     let session_manager = state.session_manager.clone();
     let pending_requests = state.pending_requests.clone();
+    let relay_data_tx = state.relay_data_tx.clone();
     let window = app_handle.get_webview_window("main")
         .ok_or("Fenêtre principale non trouvée")?;
 
@@ -1267,9 +1287,24 @@ async fn start_listening_for_requests(
                                 eprintln!("[LISTENER] Erreur envoi event UI: {}", e);
                             }
                         }
+                    } else if msg.is_type("Relay") {
+                        // Données relay entrantes : décoder base64 et transmettre au transport
+                        if let Some(data_b64) = msg.get_str("data") {
+                            use base64::prelude::*;
+                            match BASE64_STANDARD.decode(&data_b64) {
+                                Ok(data) => {
+                                    let guard = relay_data_tx.lock().await;
+                                    if let Some(ref tx) = *guard {
+                                        let _ = tx.send(data);
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("[LISTENER] Erreur décodage relay base64: {}", e);
+                                }
+                            }
+                        }
                     }
-                    // Les autres messages (Offer, Answer, ICE) sont gérés directement
-                    // par les méthodes de SessionManager (accept_connection, connect_to_device, etc.)
+                    // Les autres messages sont gérés par les méthodes SessionManager
                 }
                 Ok(None) => {
                     // Timeout - pas de message, on reboucle (le lock a été relâché)
@@ -1625,6 +1660,7 @@ fn main() {
         active_encoder: Arc::new(Mutex::new(None)),
         e2e_session_key: Arc::new(Mutex::new(None)),
         sys_handle: Arc::new(std::sync::Mutex::new(sys_init)),
+        relay_data_tx: Arc::new(Mutex::new(None)),
     };
 
     // Cloner pour les closures

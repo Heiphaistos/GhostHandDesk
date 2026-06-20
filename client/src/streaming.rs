@@ -6,7 +6,7 @@ use crate::adaptive_bitrate::AdaptiveBitrateController;
 use crate::crypto::{CryptoManager, EncryptedData};
 use crate::error::{GhostHandError, Result};
 use crate::input_control::{InputController, MouseButton, MouseEvent as InputMouseEvent, KeyboardEvent as InputKeyboardEvent, KeyModifiers};
-use crate::network::WebRTCConnection;
+use crate::network::Transport;
 use crate::protocol::ControlMessage;
 use crate::screen_capture::ScreenCapturer;
 use crate::video_encoder::VideoEncoder;
@@ -30,7 +30,7 @@ pub type LocalFrameCallback = Arc<dyn Fn(Vec<u8>, u32, u32, u64) + Send + Sync>;
 pub struct Streamer {
     capturer: Arc<Mutex<Box<dyn ScreenCapturer>>>,
     encoder: Arc<Mutex<Box<dyn VideoEncoder>>>,
-    webrtc: Arc<Mutex<WebRTCConnection>>,
+    webrtc: Arc<Mutex<Transport>>,
     framerate: u32,
     running: Arc<AtomicBool>,
     adaptive_controller: Option<Arc<Mutex<AdaptiveBitrateController>>>,
@@ -44,7 +44,7 @@ impl Streamer {
     pub fn new(
         capturer: Box<dyn ScreenCapturer>,
         encoder: Box<dyn VideoEncoder>,
-        webrtc: WebRTCConnection,
+        webrtc: Transport,
         framerate: u32,
     ) -> Self {
         Self {
@@ -255,14 +255,14 @@ impl Streamer {
 
 /// Receiver : réception et décodage vidéo
 pub struct Receiver {
-    webrtc: Arc<Mutex<WebRTCConnection>>,
+    webrtc: Arc<Mutex<Transport>>,
     /// Clé de session E2E pour déchiffrement (synchronisée avec Streamer distant)
     session_key: Option<Arc<Vec<u8>>>,
 }
 
 impl Receiver {
     /// Créer un nouveau receiver
-    pub fn new(webrtc: WebRTCConnection) -> Self {
+    pub fn new(webrtc: Transport) -> Self {
         Self {
             webrtc: Arc::new(Mutex::new(webrtc)),
             session_key: None,
@@ -459,7 +459,7 @@ impl InputHandler {
     }
 
     /// Setup le handler sur une connexion WebRTC existante
-    pub async fn attach_to_webrtc(self: Arc<Self>, webrtc: Arc<Mutex<WebRTCConnection>>) -> Result<()> {
+    pub async fn attach_to_webrtc(self: Arc<Self>, webrtc: Arc<Mutex<Transport>>) -> Result<()> {
         info!("Attachement du InputHandler au WebRTC");
 
         // Créer un canal mpsc pour éviter les "lost wakeups"

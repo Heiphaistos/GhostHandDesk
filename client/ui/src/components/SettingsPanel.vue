@@ -156,11 +156,19 @@
 
           <div class="setting-item" v-if="settings.requirePassword">
             <label>Mot de passe de connexion</label>
-            <input
-              type="password"
-              v-model="settings.connectionPassword"
-              placeholder="••••••••"
-            />
+            <small v-if="passwordAlreadySet && !settings.connectionPassword" class="pwd-hint">
+              ✓ Mot de passe défini — laissez vide pour conserver, ou saisissez-en un nouveau
+            </small>
+            <div class="pwd-field">
+              <input
+                :type="showPassword ? 'text' : 'password'"
+                v-model="settings.connectionPassword"
+                :placeholder="passwordAlreadySet ? '(inchangé)' : 'Choisir un mot de passe'"
+              />
+              <button type="button" class="pwd-toggle" @click="showPassword = !showPassword" :title="showPassword ? 'Masquer' : 'Afficher'">
+                {{ showPassword ? '🙈' : '👁️' }}
+              </button>
+            </div>
           </div>
 
           <div class="setting-item checkbox-item">
@@ -199,6 +207,11 @@ const emit = defineEmits<{
   close: [];
   update: [settings: any];
 }>();
+
+// Toggle visibilité mot de passe
+const showPassword = ref(false);
+// Indique si un hash de mot de passe existe déjà côté Rust
+const passwordAlreadySet = ref(false);
 
 // Settings state
 const settings = ref({
@@ -255,6 +268,8 @@ onMounted(async () => {
       settings.value.hardwareAcceleration = config.video_config?.hardware_acceleration ?? settings.value.hardwareAcceleration;
       settings.value.requirePassword = config.security_config?.require_auth ?? settings.value.requirePassword;
       settings.value.encryptData = config.security_config?.e2e_encryption ?? settings.value.encryptData;
+      // Déterminer si un mot de passe est déjà configuré (hash présent)
+      passwordAlreadySet.value = !!(config.security_config?.require_auth && config.security_config?.password_hash);
       console.log('[SETTINGS] Config chargée depuis le backend');
     }
   } catch (error) {
@@ -534,6 +549,44 @@ function resetToDefaults() {
 }
 
 .btn-secondary:hover {
+  background: #4a4a4a;
+}
+
+/* Mot de passe */
+.pwd-hint {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 11px;
+  color: #4ec9b0;
+}
+
+.pwd-field {
+  display: flex;
+  gap: 6px;
+}
+
+.pwd-field input {
+  flex: 1;
+  padding: 10px 12px;
+  background: #3c3c3c;
+  border: 1px solid #555;
+  border-radius: 6px;
+  color: #fff;
+  font-size: 13px;
+}
+
+.pwd-toggle {
+  background: #3c3c3c;
+  border: 1px solid #555;
+  border-radius: 6px;
+  color: #ccc;
+  cursor: pointer;
+  padding: 0 10px;
+  font-size: 16px;
+  transition: background 0.2s;
+}
+
+.pwd-toggle:hover {
   background: #4a4a4a;
 }
 

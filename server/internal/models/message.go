@@ -18,7 +18,8 @@ const (
 	TypePing               MessageType = "Ping"
 	TypePong               MessageType = "Pong"
 	TypeError              MessageType = "Error"
-	TypeAck                MessageType = "Ack" // Acquittement de réception
+	TypeAck                MessageType = "Ack"   // Acquittement de réception
+	TypeRelay              MessageType = "Relay" // Relais de données binaires entre deux pairs connectés
 )
 
 // Message représente un message de signalement
@@ -96,6 +97,13 @@ type AckMessage struct {
 	MessageType string `json:"message_type"` // Type du message acquitté
 	Status      string `json:"status"`       // "success" ou "error"
 	Message     string `json:"message,omitempty"`
+}
+
+// RelayMessage - données binaires relayées entre deux pairs (base64-encodées)
+type RelayMessage struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+	Data string `json:"data"` // payload base64-encodé
 }
 
 // Note: La struct Client active est dans signaling/hub.go
