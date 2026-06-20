@@ -10,10 +10,22 @@ import (
 	"github.com/heiphaistos44-crypto/GhostHandDesk/server/internal/models"
 )
 
+// pendingEntry stocke une paire de connexion avec son timestamp d'expiration
+type pendingEntry struct {
+	fromID    string
+	expiresAt time.Time
+}
+
+// PendingConnectionTTL : délai max entre ConnectRequest et accept/reject (60s)
+const PendingConnectionTTL = 60 * time.Second
+
 // Hub gère tous les clients connectés et route les messages
 type Hub struct {
 	// Clients enregistrés
 	clients map[string]*Client
+
+	// Limite de clients simultanés (VULN-FIX-A1)
+	maxClients int
 
 	// Canal pour enregistrer un nouveau client
 	register chan *Client
@@ -27,8 +39,9 @@ type Hub struct {
 	// Mutex pour protéger l'accès concurrent
 	mu sync.RWMutex
 
-	// pendingConnections tracks active password handshake pairs: targetID -> fromID
-	pendingConnections map[string]string
+	// pendingConnections tracks active password handshake pairs: targetID -> pendingEntry
+	// VULN-FIX-A2: TTL ajouté pour éviter accumulation mémoire
+	pendingConnections map[string]pendingEntry
 	pcMu               sync.Mutex
 
 	// relayPairs tracks bidirectional relay sessions: clientA → clientB et clientB → clientA
@@ -59,14 +72,20 @@ type BroadcastMessage struct {
 	Message []byte
 }
 
-// NewHub crée un nouveau hub
+// NewHub crée un nouveau hub avec une limite de clients
 func NewHub() *Hub {
+	return NewHubWithLimit(1000)
+}
+
+// NewHubWithLimit crée un hub avec une limite configurable de clients simultanés
+func NewHubWithLimit(maxClients int) *Hub {
 	return &Hub{
 		clients:            make(map[string]*Client),
+		maxClients:         maxClients,
 		register:           make(chan *Client),
 		unregister:         make(chan *Client),
 		broadcast:          make(chan *BroadcastMessage),
-		pendingConnections: make(map[string]string),
+		pendingConnections: make(map[string]pendingEntry),
 		relayPairs:         make(map[string]string),
 	}
 }
@@ -100,23 +119,38 @@ func (h *Hub) ClearRelayPair(clientID string) {
 }
 
 // RegisterPendingConnection enregistre une paire fromID→targetID en attente de handshake
+// VULN-FIX-A2: TTL de 60s pour éviter l'accumulation de paires fantômes
 func (h *Hub) RegisterPendingConnection(targetID, fromID string) {
 	h.pcMu.Lock()
-	h.pendingConnections[targetID] = fromID
+	h.pendingConnections[targetID] = pendingEntry{
+		fromID:    fromID,
+		expiresAt: time.Now().Add(PendingConnectionTTL),
+	}
 	h.pcMu.Unlock()
 }
 
 // IsPeerAuthorized vérifie que senderID est bien partie de la paire en cours avec peerID
+// VULN-FIX-A2: Vérifie aussi l'expiration du TTL
 func (h *Hub) IsPeerAuthorized(senderID, peerID string) bool {
 	h.pcMu.Lock()
 	defer h.pcMu.Unlock()
+	now := time.Now()
 	// Sens 1: sender est le "from", peer est le "target"
-	if from, ok := h.pendingConnections[peerID]; ok && from == senderID {
-		return true
+	if entry, ok := h.pendingConnections[peerID]; ok && entry.fromID == senderID {
+		if now.Before(entry.expiresAt) {
+			return true
+		}
+		// Entrée expirée: nettoyage silencieux
+		delete(h.pendingConnections, peerID)
+		log.Printf("[HUB] PendingConnection expirée pour target=%s", peerID)
 	}
 	// Sens 2: sender est le "target", peer est le "from"
-	if from, ok := h.pendingConnections[senderID]; ok && from == peerID {
-		return true
+	if entry, ok := h.pendingConnections[senderID]; ok && entry.fromID == peerID {
+		if now.Before(entry.expiresAt) {
+			return true
+		}
+		delete(h.pendingConnections, senderID)
+		log.Printf("[HUB] PendingConnection expirée pour target=%s", senderID)
 	}
 	return false
 }
@@ -128,15 +162,54 @@ func (h *Hub) ClearPendingConnection(targetID string) {
 	h.pcMu.Unlock()
 }
 
+// cleanExpiredPendingConnections nettoie les paires expirées (appelé périodiquement)
+// VULN-FIX-A2: Nettoyage actif pour éviter le memory leak
+func (h *Hub) cleanExpiredPendingConnections() {
+	h.pcMu.Lock()
+	defer h.pcMu.Unlock()
+	now := time.Now()
+	for targetID, entry := range h.pendingConnections {
+		if now.After(entry.expiresAt) {
+			delete(h.pendingConnections, targetID)
+			log.Printf("[HUB] PendingConnection expirée nettoyée: %s", targetID)
+		}
+	}
+}
+
 // Run démarre la boucle principale du hub
 func (h *Hub) Run() {
+	// Ticker pour le nettoyage périodique des pending connections expirées (VULN-FIX-A2)
+	cleanupTicker := time.NewTicker(30 * time.Second)
+	defer cleanupTicker.Stop()
+
 	for {
 		select {
+		case <-cleanupTicker.C:
+			h.cleanExpiredPendingConnections()
+
 		case client := <-h.register:
 			h.mu.Lock()
+			// VULN-FIX-A1: Enforcer la limite de clients simultanés
+			if h.maxClients > 0 && len(h.clients) >= h.maxClients {
+				h.mu.Unlock()
+				log.Printf("[HUB] ❌ Limite de clients atteinte (%d/%d), rejet de %s", len(h.clients), h.maxClients, client.ID)
+				// Envoyer un message d'erreur avant de fermer
+				errorMsg := map[string]interface{}{
+					"type": "Error",
+					"data": map[string]interface{}{
+						"code":    503,
+						"message": "Serveur saturé, réessayez plus tard",
+					},
+				}
+				if data, err := json.Marshal(errorMsg); err == nil {
+					client.Conn.WriteMessage(websocket.TextMessage, data)
+				}
+				client.Conn.Close()
+				continue
+			}
 			h.clients[client.ID] = client
 			h.mu.Unlock()
-			log.Printf("[HUB] Client enregistré: %s (Total: %d)", client.ID, len(h.clients))
+			log.Printf("[HUB] Client enregistré: %s (Total: %d/%d)", client.ID, len(h.clients), h.maxClients)
 
 		case client := <-h.unregister:
 			h.mu.Lock()
@@ -146,7 +219,7 @@ func (h *Hub) Run() {
 					client.closed = true
 					close(client.Send)
 				}
-				log.Printf("[HUB] Client désenregistré: %s (Total: %d)", client.ID, len(h.clients))
+				log.Printf("[HUB] Client désenregistré: %s (Total: %d/%d)", client.ID, len(h.clients), h.maxClients)
 			}
 			h.mu.Unlock()
 			h.ClearRelayPair(client.ID)

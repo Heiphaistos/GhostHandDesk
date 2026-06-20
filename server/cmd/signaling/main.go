@@ -79,6 +79,25 @@ func (rl *simpleRateLimiter) allow(ip string) bool {
 	return true
 }
 
+// cleanup supprime les entrées IP inactives pour éviter le memory leak (VULN-FIX-A7)
+func (rl *simpleRateLimiter) cleanup() {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	cutoff := time.Now().Add(-rl.window)
+	for ip, reqs := range rl.requests {
+		hasRecent := false
+		for _, t := range reqs {
+			if t.After(cutoff) {
+				hasRecent = true
+				break
+			}
+		}
+		if !hasRecent {
+			delete(rl.requests, ip)
+		}
+	}
+}
+
 // generateSelfSignedCert génère des certificats auto-signés pour le développement
 func generateSelfSignedCert(certPath, keyPath string) error {
 	log.Println("[CERT] Génération de certificats auto-signés pour le développement...")
@@ -192,8 +211,8 @@ func main() {
 	}
 	log.Println("[MAIN] Configuration validée avec succès")
 
-	// Créer et démarrer le hub
-	hub := signaling.NewHub()
+	// Créer et démarrer le hub avec la limite de clients configurée (VULN-FIX-A1)
+	hub := signaling.NewHubWithLimit(cfg.MaxClients)
 	go hub.Run()
 	log.Println("[MAIN] Hub de signalement démarré")
 
@@ -202,6 +221,15 @@ func main() {
 
 	// Rate limiter pour les endpoints HTTP (30 req/min par IP)
 	httpLimiter := newSimpleRateLimiter(30, time.Minute)
+
+	// Nettoyage périodique du rate limiter pour éviter les memory leaks (VULN-FIX-A7)
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			httpLimiter.cleanup()
+		}
+	}()
 
 	// Configurer les routes HTTP
 	mux := http.NewServeMux()
@@ -221,7 +249,7 @@ func main() {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.WriteHeader(http.StatusOK)
-		if err := json.NewEncoder(w).Encode(map[string]interface{}{
+		if err := json.NewEncoder(w).Encode(map[string]any{
 			"status":  "healthy",
 			"clients": hub.GetClientCount(),
 		}); err != nil {
@@ -251,7 +279,7 @@ func main() {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
-		if err := json.NewEncoder(w).Encode(map[string]interface{}{
+		if err := json.NewEncoder(w).Encode(map[string]any{
 			"total_clients": totalClients,
 			"uptime":        time.Since(startTime).String(),
 			"max_clients":   cfg.MaxClients,

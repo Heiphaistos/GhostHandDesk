@@ -57,7 +57,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' blob: data:; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://localhost:* wss://localhost:*"
+      "csp": "default-src 'self'; img-src 'self' blob: data:; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://localhost:9000 ws://localhost:9001 ws://localhost:9002 ws://localhost:9003 ws://localhost:9004 ws://127.0.0.1:9000 ws://127.0.0.1:9001 ws://127.0.0.1:9002 ws://127.0.0.1:9003 ws://127.0.0.1:9004 wss://ghd.heiphaistos.org"
     },
     "trayIcon": {
       "iconPath": "icons/icon.png",

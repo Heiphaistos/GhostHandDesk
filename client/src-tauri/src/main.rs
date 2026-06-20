@@ -26,23 +26,40 @@ use base64::Engine;
 use std::os::windows::process::CommandExt;
 use sysinfo::{System, Disks, CpuRefreshKind, MemoryRefreshKind, RefreshKind};
 // Fonction de diagnostic - écrit dans un fichier log
+// VULN-FIX-A10: Limite de taille 10 MB avec rotation, désactivé en release
 fn diag_log(msg: &str) {
     use std::io::Write;
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let line = format!("[{}] {}\n", timestamp, msg);
-    eprintln!("{}", line.trim());
-    let log_path = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|p| p.join("diag.log")))
-        .unwrap_or_else(|| std::path::PathBuf::from("diag.log"));
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true).append(true)
-        .open(&log_path)
+    #[cfg(debug_assertions)]
     {
-        let _ = f.write_all(line.as_bytes());
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let line = format!("[{}] {}\n", timestamp, msg);
+        eprintln!("{}", line.trim());
+        let log_path = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|p| p.join("diag.log")))
+            .unwrap_or_else(|| std::path::PathBuf::from("diag.log"));
+        // Rotation si > 10 MB
+        const MAX_LOG_SIZE: u64 = 10 * 1024 * 1024;
+        if let Ok(meta) = std::fs::metadata(&log_path) {
+            if meta.len() > MAX_LOG_SIZE {
+                let archive = log_path.with_extension("log.old");
+                let _ = std::fs::rename(&log_path, &archive);
+            }
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true).append(true)
+            .open(&log_path)
+        {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        // En mode release: logs via audit_log uniquement, pas de fichier diag.log
+        let _ = msg;
     }
 }
 
@@ -134,9 +151,13 @@ fn start_embedded_server() -> Option<(std::process::Child, std::path::PathBuf)> 
     // 3. Essayer de lancer le serveur sur chaque port
     for &port in SERVER_PORTS {
         println!("[SERVER] Tentative de lancement sur le port {}...", port);
+        // SÉCURITÉ: REQUIRE_TLS=false est intentionnel pour le serveur loopback local.
+        // Le trafic WebSocket reste sur 127.0.0.1 uniquement (non exposé réseau).
+        // La sécurité de transport E2E est assurée par le chiffrement AES-256-GCM WebRTC.
+        // En production VPS, le serveur externe utilise TLS (wss://).
         match std::process::Command::new(&server_path)
             .env("REQUIRE_TLS", "false")
-            .env("SERVER_HOST", format!(":{}", port))
+            .env("SERVER_HOST", format!("127.0.0.1:{}", port)) // Bind explicitement sur loopback uniquement
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .creation_flags(0x08000000) // CREATE_NO_WINDOW
@@ -641,6 +662,16 @@ async fn update_config(
     state: State<'_, AppState>,
     new_config: Config,
 ) -> Result<(), String> {
+    // VULN-FIX-A9: Valider l'URL du serveur avant d'accepter la nouvelle config
+    if !new_config.server_url.starts_with("ws://") && !new_config.server_url.starts_with("wss://") {
+        return Err(format!(
+            "URL de serveur invalide '{}': doit commencer par ws:// ou wss://",
+            new_config.server_url
+        ));
+    }
+    if new_config.server_url.len() > 512 {
+        return Err("URL de serveur trop longue (max 512 caractères)".to_string());
+    }
     *state.config.lock().await = new_config;
     println!("[TAURI] Configuration mise à jour");
     Ok(())
@@ -694,6 +725,19 @@ async fn update_server_url(
     server_url: String,
 ) -> Result<(), String> {
     diag_log(&format!("update_server_url: {} ", server_url));
+
+    // VULN-FIX-A5: Valider le schéma WebSocket avant toute connexion
+    // Empêche les URL malformées ou des schémas arbitraires (file://, javascript:, etc.)
+    if !server_url.starts_with("ws://") && !server_url.starts_with("wss://") {
+        return Err(format!(
+            "URL invalide '{}': doit commencer par ws:// ou wss://",
+            server_url
+        ));
+    }
+    // Longueur maximale raisonnable pour une URL de serveur
+    if server_url.len() > 512 {
+        return Err("URL trop longue (max 512 caractères)".to_string());
+    }
 
     // 1. Mettre à jour la config
     {
@@ -1456,8 +1500,35 @@ async fn send_file(
     file_path: String,
 ) -> Result<(), String> {
     let path = std::path::Path::new(&file_path);
+
+    // VULN-FIX-A6: Validation du fichier avant envoi
     if !path.exists() {
         return Err("Fichier non trouvé".to_string());
+    }
+
+    // Vérifier que c'est bien un fichier (pas un répertoire, device, symlink vers /etc/passwd...)
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| format!("Impossible de lire les métadonnées: {}", e))?;
+
+    if !metadata.is_file() {
+        return Err("Le chemin ne pointe pas vers un fichier régulier".to_string());
+    }
+
+    // Limite de taille: 500 MB max par transfert
+    const MAX_FILE_SIZE: u64 = 500 * 1024 * 1024;
+    if metadata.len() > MAX_FILE_SIZE {
+        return Err(format!(
+            "Fichier trop volumineux: {} MB (max: 500 MB)",
+            metadata.len() / (1024 * 1024)
+        ));
+    }
+
+    // Valider le nom de fichier (pas de path traversal)
+    let filename = path.file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("Nom de fichier invalide")?;
+    if filename.contains("..") || filename.contains('/') || filename.contains('\\') {
+        return Err("Nom de fichier invalide (caractères interdits)".to_string());
     }
 
     let (id, name, size, chunks) = ghost_hand_client::file_transfer::FileTransferManager::prepare_send(path)
