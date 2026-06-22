@@ -1,177 +1,182 @@
-# GhostHandDesk
-## Démonstration
+<div align="center">
+  <h1>👻 GhostHandDesk</h1>
+  <p><strong>Application de bureau Windows pour contrôle à distance sécurisé via relay VPS — prenez la main sur n'importe quelle machine.</strong></p>
+
+  ![Version](https://img.shields.io/badge/version-0.5.1-blue)
+  ![Stack](https://img.shields.io/badge/stack-Tauri%20v2%20%2B%20Rust%20%2B%20Vue3-purple)
+  ![License](https://img.shields.io/badge/license-MIT-green)
+  ![Platform](https://img.shields.io/badge/platform-Windows-0078D6)
+</div>
+
+---
+
+## 📋 Description
+
+GhostHandDesk est une application de bureau Tauri v2 permettant le contrôle à distance de machines Windows via un relay VPS centralisé. Le relay gère la mise en relation entre le client et le poste cible sans exposition directe des ports — seul le relay VPS est accessible publiquement. Conçue pour être légère, sécurisée et simple d'utilisation.
+
+---
+
+## 🎬 Démonstration
 
 <video src="https://media.heiphaistos.org/videos/ghosthanddesk.mp4" controls width="100%" preload="none"></video>
 
-[![Version](https://img.shields.io/badge/version-0.4.0-blue.svg)](https://github.com/heiphaistos44-crypto/GhostHandDesk)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org/)
-[![Go](https://img.shields.io/badge/go-1.20+-00ADD8.svg)](https://golang.org/)
-[![Tests](https://img.shields.io/badge/tests-70%20passed-brightgreen.svg)]()
+---
 
-**GhostHandDesk** est une solution de bureau a distance open-source, securisee et performante, construite avec Rust, Go et WebRTC.
+## ✨ Fonctionnalités
 
-Un seul executable portable embarque le client (Tauri + Vue.js) et le serveur de signalement (Go), sans installation requise.
+- **Connexion relay VPS** : Mise en relation sécurisée via serveur relay — aucun port à ouvrir sur la machine cible
+- **Contrôle à distance** : Prise en main complète du bureau distant (souris, clavier, affichage)
+- **Gestion des sessions** : Historique des connexions, reconnexion automatique, timeout configurable
+- **Rejet auto-connexion** : Protection contre les connexions non sollicitées (réponse 400 explicite)
+- **Interface moderne** : UI Vue 3 intégrée dans Tauri, fluide et réactive
+- **Installeur NSIS** : Distribution Windows avec installeur silencieux
+- **Relay PM2** : Serveur relay déployé sur VPS avec gestion de processus PM2
 
 ---
 
-## Demarrage Rapide
+## 🛠️ Stack technique
 
-### Option 1 : Executable Portable (recommande)
+| Couche | Technologies |
+|--------|-------------|
+| Application desktop | Tauri v2 · Rust |
+| Interface utilisateur | Vue 3 · TypeScript · Vite · TailwindCSS |
+| Relay serveur | Node.js · Express · WebSocket |
+| Déploiement relay | VPS · PM2 · nginx |
+| Distribution | Installeur NSIS Windows |
 
-Telechargez `GhostHandDesk_0.4.0_portable_x64.exe` depuis les [releases GitHub](https://github.com/heiphaistos44-crypto/GhostHandDesk/releases) et double-cliquez. Aucune installation, aucun autre fichier requis : le serveur de signalement est embarque dans l'exe et demarre automatiquement.
+---
 
-### Option 2 : Depuis les sources
+## 🚀 Installation
+
+### Installation bureau (Windows)
+
+Télécharger l'installeur depuis les [Releases GitHub](https://github.com/Heiphaistos/GhostHandDesk/releases/tag/v0.5.1) :
+
+```
+GhostHandDesk_0.5.1_x64-setup.exe
+```
+
+Lancer l'installeur et suivre les étapes. L'application est disponible dans le menu Démarrer après installation.
+
+### Build depuis les sources
+
+#### Prérequis
+
+- Node.js >= 20
+- Rust >= 1.77 (stable)
+- Tauri CLI v2 (`cargo install tauri-cli`)
+- WebView2 Runtime (inclus sur Windows 11)
+
+#### Développement
 
 ```bash
-# Prerequis : Rust 1.70+, Node.js 18+, Go 1.20+
+# Cloner le dépôt
+git clone https://github.com/Heiphaistos/GhostHandDesk.git
+cd GhostHandDesk
 
-# Build complet (serveur Go + frontend Vue + client Tauri)
-cd server && go build -o signaling-server.exe ./cmd/signaling/
-cd ../client && npx tauri build
+# Installer les dépendances frontend
+npm install
+
+# Lancer en mode développement
+npm run tauri dev
+```
+
+#### Build production
+
+```bash
+# Build installeur NSIS
+npm run tauri build
+
+# L'installeur se trouve dans :
+# src-tauri/target/release/bundle/nsis/GhostHandDesk_0.5.1_x64-setup.exe
 ```
 
 ---
 
-## Architecture
+## 🖥️ Déploiement du Relay VPS
+
+Le relay est déployé sur le VPS et géré par PM2.
+
+### Configuration
+
+```bash
+# Sur le VPS, déployer le relay
+cd /opt/ghosthanddesk
+npm install
+
+# Lancer avec PM2 (--cwd requis)
+pm2 start server.js --name ghosthanddesk --cwd /opt/ghosthanddesk
+
+# Sauvegarder la config PM2
+pm2 save
+```
+
+### Variables d'environnement relay
+
+```env
+PORT=3025
+RELAY_SECRET=votre_secret_relay
+MAX_SESSIONS=50
+SESSION_TIMEOUT_MS=300000
+```
+
+### Configuration nginx (relay)
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name relay.heiphaistos.org;
+
+    location / {
+        proxy_pass http://127.0.0.1:3025;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+```
+
+---
+
+## 📁 Structure du projet
 
 ```
 GhostHandDesk/
-├── client/                     # Client (Rust + Tauri v2 + Vue.js 3)
-│   ├── src/                    # Bibliotheque Rust (reseau, video, crypto, etc.)
-│   ├── src-tauri/              # Application Tauri (commandes, etat, IPC)
-│   └── ui/                     # Interface Vue.js 3 (TypeScript + Vite)
-├── server/                     # Serveur de signalement (Go + WebSocket)
-│   ├── cmd/signaling/          # Point d'entree
-│   └── internal/signaling/     # Hub, handlers, rate limiting
-└── docs/                       # Documentation technique
+├── src/               # Frontend Vue 3
+│   ├── components/    # SessionPanel, ConnectionStatus, Controls
+│   ├── stores/        # Pinia (session, config)
+│   └── views/         # Main, Settings
+├── src-tauri/         # Backend Rust Tauri
+│   ├── src/
+│   │   ├── relay.rs   # Client relay WebSocket
+│   │   ├── capture.rs # Capture écran
+│   │   └── input.rs   # Injection souris/clavier
+│   └── Cargo.toml
+├── server/            # Relay Node.js (VPS)
+│   └── server.js
+└── deploy/            # Scripts déploiement VPS
 ```
 
-### Stack Technique
+---
 
-| Composant | Technologie | Role |
-|-----------|-------------|------|
-| Client lib | Rust | Reseau, WebRTC, capture ecran, encodage video, crypto |
-| Desktop app | Tauri v2 | Fenetre native, IPC, serveur embarque |
-| Frontend | Vue.js 3 + TypeScript | Interface utilisateur |
-| Signaling | Go + gorilla/websocket | Decouverte de pairs, relay WebSocket |
-| Transport | WebRTC (DTLS-SRTP) | Connexion P2P, chiffrement natif |
+## 📸 Aperçu
+
+![screenshot](./docs/screenshot.png)
 
 ---
 
-## Fonctionnalites
+## 🔐 Sécurité
 
-### Connexion
-- **Serveur embarque** : le serveur Go est integre dans l'executable via `include_bytes!`
-- **Multi-instance** : detection automatique de serveur existant, fallback ports 9000-9004
-- **Device ID unique** : genere avec timestamp + composante aleatoire
-- **Demande de connexion** : popup d'acceptation/rejet sur l'instance cible
-- **WebRTC P2P** : connexion directe entre pairs apres echange SDP/ICE
-
-### Video
-- **Capture ecran** : via `xcap` avec support multi-moniteur
-- **Encodage JPEG** : encodeur d'images avec qualite configurable
-- **Streaming adaptatif** : bitrate adaptatif base sur les conditions reseau
-- **Presets qualite** : Basse (15 FPS), Moyenne (30 FPS), Haute (60 FPS)
-
-### Controle distant
-- **Souris** : clic, deplacement, scroll, clic droit
-- **Clavier** : toutes les touches avec propagation des modifiers (Ctrl, Shift, Alt, Meta)
-- **Protocole binaire** : `ControlMessage` serialise en binaire pour les frames video, JSON pour le reste
-
-### Securite
-- **CSP** : Content Security Policy stricte dans la webview Tauri
-- **Chiffrement E2E** : X25519 ECDH + AES-256-GCM (module crypto)
-- **PBKDF2-SHA256** : 100 000 iterations pour les mots de passe de connexion
-- **Device ID persistant** : 128 bits cryptographiquement aleatoires (fichier `data/device.id`)
-- **Authentification par mot de passe** : challenge/response avec hachage
-- **Validation des entrees** : Device ID, SDP, ICE candidates, frames video
-- **Rate limiting** : 100 messages/minute par client cote serveur
-- **TLS auto-detecte** : detection automatique via `CERT_FILE` + `KEY_FILE`
-- **4 serveurs STUN** : Google x2, Cloudflare, Mozilla (fallback automatique)
-- **Audit trail** : logs structures JSON avec niveaux de severite
-- **Sanitisation UTF-8** : troncature safe aux frontieres de caracteres
-
-### Persistance
-- **Historique connexions** : sauvegarde locale des connexions passees
-- **Pairs connus** : liste des appareils avec favoris
-- **Configuration** : parametres video, reseau, securite persistes
+- Relay VPS : seul point d'entrée, les machines cibles ne sont pas exposées directement
+- Rejet automatique des tentatives de connexion non autorisées (HTTP 400)
+- Sessions avec timeout configurable
+- Authentification par secret partagé entre client et relay
+- Logs des connexions IP + timestamp
 
 ---
 
-## Configuration
+## 📝 Licence
 
-L'interface de parametres permet de configurer :
-
-| Categorie | Options |
-|-----------|---------|
-| Video | Codec (H264/JPEG), framerate (15-60), bitrate (1000-10000 kbps), qualite JPEG |
-| Reseau | URL serveur signalement, serveurs STUN |
-| Performance | Acceleration materielle, mode faible latence, bitrate adaptatif |
-| Securite | Mot de passe connexion, chiffrement E2E |
-
----
-
-## Tests
-
-```bash
-# Tests unitaires Rust (50 tests)
-cd client && cargo test --lib
-
-# Tests d'integration (8 tests)
-cargo test --test integration_test
-
-# Tests de securite (8 tests)
-cargo test --test security_tests
-
-# Tests connexion (4 tests)
-cargo test --test integration_connect_request
-
-# Tests serveur Go
-cd ../server && go test ./internal/signaling/... -v
-```
-
-**70 tests, 0 echecs, 0 warnings de compilation.**
-
----
-
-## Statistiques du projet
-
-| Metrique | Valeur |
-|----------|--------|
-| Lignes de code | ~10,200 |
-| Rust | 6,560 lignes (16 fichiers) |
-| Vue.js | 2,230 lignes (5 composants) |
-| Go | 1,400 lignes (6 fichiers) |
-| Tests | 70 (50 unit + 20 integration/securite) |
-| Taille exe | ~32 MB (client + serveur embarque) |
-
----
-
-## Documentation
-
-- [Architecture](docs/ARCHITECTURE.md) - Architecture technique detaillee
-- [Developpement](docs/DEVELOPMENT.md) - Guide de developpement
-- [Contribution](docs/CONTRIBUTING.md) - Guide de contribution
-
----
-
-## License
-
-MIT License
-
----
-
-## Utilisation sans VPS (P2P auto-heberge)
-
-1. **PC A** (hote) : copier `GhostHandDesk_0.4.0_portable_x64.exe`, ouvrir port 9000 TCP, lancer l'exe
-2. **PC B** : meme exe, dans Parametres → URL : `ws://<IP_PC_A>:9000/ws`
-3. Entrer le Device ID du PC A → Connecter
-
-## Avec VPS public
-
-Configurer l'URL : `wss://votre-vps.example.com/ws`
-
----
-
-**Built with Rust, Go, Tauri and Vue.js**
+MIT — © 2026 Heiphaistos
